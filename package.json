@@ -1,0 +1,97 @@
+{
+  "name": "logbun",
+  "version": "0.1.1",
+  "type": "module",
+  "description": "Production-ready audit logging for Bun-based multi-tenant SaaS platforms.",
+  "license": "MIT",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./adapters/sqlite": {
+      "types": "./dist/adapters/sqlite.d.ts",
+      "import": "./dist/adapters/sqlite.js"
+    },
+    "./adapters/turso": {
+      "types": "./dist/adapters/turso.d.ts",
+      "import": "./dist/adapters/turso.js"
+    },
+    "./adapters/clickhouse": {
+      "types": "./dist/adapters/clickhouse.d.ts",
+      "import": "./dist/adapters/clickhouse.js"
+    },
+    "./plugins/elysia": {
+      "types": "./dist/plugins/elysia.d.ts",
+      "import": "./dist/plugins/elysia.js"
+    },
+    "./plugins/hono": {
+      "types": "./dist/plugins/hono.d.ts",
+      "import": "./dist/plugins/hono.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit",
+    "lint": "bunx eslint ."
+  },
+  "peerDependencies": {
+    "@libsql/client": ">=0.6.0",
+    "@clickhouse/client": ">=1.0.0",
+    "elysia": ">=1.0.0",
+    "hono": ">=4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@libsql/client": {
+      "optional": true
+    },
+    "@clickhouse/client": {
+      "optional": true
+    },
+    "elysia": {
+      "optional": true
+    },
+    "hono": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "tsup": "^8.4.0",
+    "typescript": "^5.9.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aashahin/logbun.git"
+  },
+  "keywords": [
+    "audit",
+    "log",
+    "logging",
+    "audit-log",
+    "audit-logging",
+    "audit-log-storage",
+    "audit-log-storage-provider",
+    "audit-log-storage-provider-turso",
+    "audit-log-storage-provider-clickhouse",
+    "audit-log-storage-provider-sqlite",
+    "audit-log-storage-provider-factory",
+    "audit-log-storage-provider-factory-turso",
+    "audit-log-storage-provider-factory-clickhouse",
+    "audit-log-storage-provider-factory-sqlite",
+    "audit-log-storage-provider-factory-turso-clickhouse-sqlite",
+    "bun",
+    "bunjs",
+    "elysia",
+    "hono"
+  ]
+}
