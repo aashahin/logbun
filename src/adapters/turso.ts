@@ -131,7 +131,7 @@ export class TursoAdapter implements IAdapter {
       args.push(filters.endDate);
     }
     if (pagination.cursor) {
-      conditions.push('id > ?');
+      conditions.push('id < ?');
       args.push(pagination.cursor);
     }
 
@@ -139,7 +139,7 @@ export class TursoAdapter implements IAdapter {
     const fetchLimit = pagination.limit + 1;
     args.push(fetchLimit);
 
-    const sql = `SELECT * FROM audit_logs ${where} ORDER BY id ASC LIMIT ?`;
+    const sql = `SELECT * FROM audit_logs ${where} ORDER BY id DESC LIMIT ?`;
     const result = await this.client.execute({ sql, args });
 
     const rows = result.rows;

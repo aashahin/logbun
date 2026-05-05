@@ -129,8 +129,8 @@ export class BunSQLiteAdapter implements IAdapter {
       params['$end_date'] = filters.endDate;
     }
     if (pagination.cursor) {
-      // UUIDv7 is lexicographically sortable — cursor-based pagination via id comparison
-      conditions.push('id > $cursor');
+      // UUIDv7 is lexicographically sortable, so descending pages advance with smaller ids.
+      conditions.push('id < $cursor');
       params['$cursor'] = pagination.cursor;
     }
 
@@ -139,7 +139,7 @@ export class BunSQLiteAdapter implements IAdapter {
     const fetchLimit = pagination.limit + 1;
     params['$limit'] = fetchLimit;
 
-    const sql = `SELECT * FROM audit_logs ${where} ORDER BY id ASC LIMIT $limit`;
+    const sql = `SELECT * FROM audit_logs ${where} ORDER BY id DESC LIMIT $limit`;
     const rows = this.db.prepare(sql).all(params) as Record<string, unknown>[];
 
     const hasMore = rows.length > pagination.limit;

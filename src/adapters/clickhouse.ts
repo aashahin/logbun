@@ -140,7 +140,7 @@ export class ClickHouseAdapter implements IAdapter {
       params['end_date'] = filters.endDate;
     }
     if (pagination.cursor) {
-      conditions.push('id > {cursor:String}');
+      conditions.push('id < {cursor:String}');
       params['cursor'] = pagination.cursor;
     }
 
@@ -149,7 +149,7 @@ export class ClickHouseAdapter implements IAdapter {
     params['fetch_limit'] = fetchLimit;
 
     const result = await this.client.query({
-      query: `SELECT * FROM audit_logs ${where} ORDER BY id ASC LIMIT {fetch_limit:UInt32}`,
+      query: `SELECT * FROM audit_logs ${where} ORDER BY id DESC LIMIT {fetch_limit:UInt32}`,
       query_params: params,
       format: 'JSONEachRow',
     });

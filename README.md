@@ -257,7 +257,7 @@ Both plugins automatically extract the client IP from `X-Forwarded-For` (first e
 
 ## Querying
 
-Cursor-based pagination using UUIDv7 (lexicographically sortable):
+Cursor-based pagination using UUIDv7 (lexicographically sortable). Results are returned newest-first:
 
 ```typescript
 // First page
