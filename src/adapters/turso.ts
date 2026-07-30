@@ -1,4 +1,5 @@
 import type { IAdapter, LogbunLog, LogbunQueryFilters, LogbunQueryResult } from './base';
+import { safeJsonParse } from '../utils/json';
 
 const CREATE_TABLE_SQL = `
   CREATE TABLE IF NOT EXISTS audit_logs (
@@ -12,15 +13,26 @@ const CREATE_TABLE_SQL = `
     metadata    TEXT,
     ip_address  TEXT,
     user_agent  TEXT,
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    prev_hash   TEXT,
+    content_hash TEXT
   )
 `;
 
+const MIGRATE_COLUMNS_SQL = [
+  `ALTER TABLE audit_logs ADD COLUMN prev_hash TEXT`,
+  `ALTER TABLE audit_logs ADD COLUMN content_hash TEXT`,
+];
+
 const CREATE_INDEXES_SQL = [
   `CREATE INDEX IF NOT EXISTS idx_audit_tenant_created ON audit_logs (tenant_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_audit_tenant_id ON audit_logs (tenant_id, id DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs (action)`,
   `CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_logs (actor_id)`,
   `CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_logs (entity_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_audit_tenant_action_created ON audit_logs (tenant_id, action, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_audit_tenant_actor_created ON audit_logs (tenant_id, actor_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_audit_tenant_entity ON audit_logs (tenant_id, entity_id)`,
 ];
 
 export interface TursoAdapterConfig {
@@ -32,7 +44,10 @@ export interface TursoAdapterConfig {
 
 /** Minimal interface for @libsql/client — avoids hard dependency on the package types */
 interface LibSQLClient {
-  execute(stmtOrSql: string | { sql: string; args: unknown[] }): Promise<{ rows: Record<string, unknown>[] }>;
+  execute(stmtOrSql: string | { sql: string; args: unknown[] }): Promise<{
+    rows: Record<string, unknown>[];
+    rowsAffected?: number;
+  }>;
   batch(stmts: { sql: string; args: unknown[] }[], mode?: string): Promise<unknown>;
   close(): void;
 }
@@ -62,18 +77,28 @@ export class TursoAdapter implements IAdapter {
     });
 
     await this.client.execute(CREATE_TABLE_SQL);
+    for (const sql of MIGRATE_COLUMNS_SQL) {
+      try {
+        await this.client.execute(sql);
+      } catch {
+        // column already exists
+      }
+    }
     for (const sql of CREATE_INDEXES_SQL) {
       await this.client.execute(sql);
     }
   }
 
   async bulkInsert(tenantId: string | null, logs: LogbunLog[]): Promise<boolean> {
-    if (!this.client) return false;
+    if (logs.length === 0) return true;
+    if (!this.client) {
+      throw new Error('TursoAdapter not initialized');
+    }
 
     try {
       const statements = logs.map((log) => ({
-        sql: `INSERT OR IGNORE INTO audit_logs (id, tenant_id, actor_id, action, entity_id, old_values, new_values, metadata, ip_address, user_agent, created_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        sql: `INSERT OR IGNORE INTO audit_logs (id, tenant_id, actor_id, action, entity_id, old_values, new_values, metadata, ip_address, user_agent, created_at, prev_hash, content_hash)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           log.id,
           log.tenantId ?? tenantId ?? null,
@@ -86,13 +111,17 @@ export class TursoAdapter implements IAdapter {
           log.ipAddress ?? null,
           log.userAgent ?? null,
           log.createdAt,
+          log.prevHash ?? null,
+          log.contentHash ?? null,
         ] as unknown[],
       }));
 
       await this.client.batch(statements, 'write');
       return true;
-    } catch {
-      return false;
+    } catch (err) {
+      throw err instanceof Error
+        ? err
+        : new Error(`TursoAdapter.bulkInsert failed: ${String(err)}`);
     }
   }
 
@@ -152,12 +181,14 @@ export class TursoAdapter implements IAdapter {
       actorId: row['actor_id'] as string,
       action: row['action'] as string,
       entityId: (row['entity_id'] as string) ?? undefined,
-      oldValues: row['old_values'] ? JSON.parse(row['old_values'] as string) as Record<string, unknown> : undefined,
-      newValues: row['new_values'] ? JSON.parse(row['new_values'] as string) as Record<string, unknown> : undefined,
-      metadata: row['metadata'] ? JSON.parse(row['metadata'] as string) as Record<string, unknown> : undefined,
+      oldValues: safeJsonParse<Record<string, unknown>>(row['old_values']),
+      newValues: safeJsonParse<Record<string, unknown>>(row['new_values']),
+      metadata: safeJsonParse<Record<string, unknown>>(row['metadata']),
       ipAddress: (row['ip_address'] as string) ?? undefined,
       userAgent: (row['user_agent'] as string) ?? undefined,
       createdAt: row['created_at'] as string,
+      prevHash: (row['prev_hash'] as string) ?? undefined,
+      contentHash: (row['content_hash'] as string) ?? undefined,
     }));
 
     const lastLog = logs[logs.length - 1];
@@ -167,13 +198,39 @@ export class TursoAdapter implements IAdapter {
     };
   }
 
+  /**
+   * Delete logs older than `days` in batches to avoid long write locks / large txns.
+   * LibSQL/SQLite supports `DELETE ... WHERE id IN (SELECT ... LIMIT n)`.
+   * If the driver omits `rowsAffected`, falls back to a single unbatched DELETE
+   * for any remaining rows (comment: single DELETE is acceptable when batch
+   * progress cannot be observed).
+   * Safety cap: 10_000 batches × 1_000 rows.
+   */
   async prune(days: number): Promise<void> {
     if (!this.client) return;
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-    await this.client.execute({
-      sql: 'DELETE FROM audit_logs WHERE created_at < ?',
-      args: [cutoff],
-    });
+    const BATCH = 1_000;
+    const MAX_BATCHES = 10_000;
+    const sql = `DELETE FROM audit_logs WHERE created_at < ? AND id IN (
+      SELECT id FROM audit_logs WHERE created_at < ? LIMIT ?
+    )`;
+
+    for (let i = 0; i < MAX_BATCHES; i++) {
+      const result = await this.client.execute({
+        sql,
+        args: [cutoff, cutoff, BATCH],
+      });
+      const affected = result.rowsAffected;
+      if (affected === undefined) {
+        // Driver did not report rowsAffected — finish with one-shot DELETE.
+        await this.client.execute({
+          sql: 'DELETE FROM audit_logs WHERE created_at < ?',
+          args: [cutoff],
+        });
+        return;
+      }
+      if (affected === 0) break;
+    }
   }
 
   async close(): Promise<void> {

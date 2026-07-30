@@ -1,4 +1,5 @@
 import type { IAdapter, LogbunLog, LogbunQueryFilters, LogbunQueryResult } from './base';
+import { safeJsonParse } from '../utils/json';
 
 export interface ClickHouseAdapterConfig {
   /** ClickHouse server URL (e.g., 'http://localhost:8123') */
@@ -11,6 +12,11 @@ export interface ClickHouseAdapterConfig {
   password?: string;
   /** Retention days for TTL. Default: 90 */
   retentionDays?: number;
+  /**
+   * When false, queries skip FINAL (faster, may show pre-merge duplicates).
+   * @default true
+   */
+  queryFinal?: boolean;
 }
 
 /** Minimal interface for @clickhouse/client — avoids hard dependency on the package types */
@@ -22,20 +28,41 @@ interface ClickHouseClient {
 }
 
 /**
+ * Convert ISO-8601 (or similar) timestamps to ClickHouse DateTime64 text format:
+ * 'YYYY-MM-DD HH:mm:ss.SSS' (UTC).
+ */
+export function toClickHouseDateTime(iso: string): string {
+  const d = new Date(iso);
+  if (!Number.isNaN(d.getTime())) {
+    const pad = (n: number, len = 2) => String(n).padStart(len, '0');
+    return (
+      `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +
+      `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}.` +
+      `${pad(d.getUTCMilliseconds(), 3)}`
+    );
+  }
+  return iso.replace('T', ' ').replace(/Z$/i, '').replace(/([+-]\d{2}:\d{2})$/, '').slice(0, 23);
+}
+
+/**
  * ClickHouseAdapter — optimized for high-volume analytics workloads.
  *
  * Forces single_database mode regardless of config — ClickHouse uses
- * PARTITION BY toYYYYMM(created_at) for physical tenant data locality
- * instead of database-per-tenant (which exhausts ZooKeeper metadata).
+ * PARTITION BY toYYYYMM(created_at) for physical data locality.
+ *
+ * Idempotency: ReplacingMergeTree with ORDER BY (tenant_id, id) collapses
+ * duplicate rows that share the same sorting key (same tenant + log id).
  *
  * @requires @clickhouse/client — install as peer dependency
  */
 export class ClickHouseAdapter implements IAdapter {
   private client: ClickHouseClient | null = null;
   private readonly config: ClickHouseAdapterConfig;
+  private readonly database: string;
 
   constructor(config: ClickHouseAdapterConfig) {
     this.config = config;
+    this.database = config.database ?? 'default';
   }
 
   async init(): Promise<void> {
@@ -43,13 +70,19 @@ export class ClickHouseAdapter implements IAdapter {
     const mod = await import('@clickhouse/client');
     this.client = (mod as { createClient: (config: Record<string, unknown>) => ClickHouseClient }).createClient({
       url: this.config.url,
-      database: this.config.database ?? 'default',
+      database: this.database,
       username: this.config.username ?? 'default',
       password: this.config.password,
     });
 
     const retentionDays = this.config.retentionDays ?? 90;
 
+    // CREATE TABLE IF NOT EXISTS is intentionally no-migrate for engine/schema:
+    // if audit_logs already exists (any engine), this is a no-op. Operators must
+    // migrate manually for engine changes (e.g. old MergeTree → ReplacingMergeTree).
+    // We keep ReplacingMergeTree for idempotent inserts (ORDER BY tenant_id, id).
+    // Query path uses FINAL by default (queryFinal !== false) for correct
+    // post-merge reads; disable only when eventual consistency is acceptable.
     await this.client.command({
       query: `
         CREATE TABLE IF NOT EXISTS audit_logs (
@@ -63,18 +96,38 @@ export class ClickHouseAdapter implements IAdapter {
           metadata     Nullable(String),
           ip_address   Nullable(String),
           user_agent   Nullable(String),
-          created_at   DateTime64(3, 'UTC')
+          created_at   DateTime64(3, 'UTC'),
+          prev_hash    Nullable(String),
+          content_hash Nullable(String)
         )
-        ENGINE = MergeTree()
+        ENGINE = ReplacingMergeTree()
         PARTITION BY toYYYYMM(created_at)
-        ORDER BY (tenant_id, created_at)
+        ORDER BY (tenant_id, id)
         TTL created_at + INTERVAL ${retentionDays} DAY DELETE
       `,
     });
+
+    // Best-effort column migrate for tables created before integrity fields.
+    // CREATE TABLE IF NOT EXISTS is a no-op on existing schemas, so ADD COLUMN
+    // is required when integrityChain is enabled later. Swallow failures
+    // (column exists, older CH without IF NOT EXISTS, or insufficient grants).
+    for (const sql of [
+      'ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS prev_hash Nullable(String)',
+      'ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS content_hash Nullable(String)',
+    ]) {
+      try {
+        await this.client.command({ query: sql });
+      } catch {
+        // column already exists / permission / version differences
+      }
+    }
   }
 
   async bulkInsert(tenantId: string | null, logs: LogbunLog[]): Promise<boolean> {
-    if (!this.client) return false;
+    if (logs.length === 0) return true;
+    if (!this.client) {
+      throw new Error('ClickHouseAdapter not initialized');
+    }
 
     try {
       const rows = logs.map((log) => ({
@@ -88,7 +141,9 @@ export class ClickHouseAdapter implements IAdapter {
         metadata: log.metadata ? JSON.stringify(log.metadata) : null,
         ip_address: log.ipAddress ?? null,
         user_agent: log.userAgent ?? null,
-        created_at: log.createdAt,
+        created_at: toClickHouseDateTime(log.createdAt),
+        prev_hash: log.prevHash ?? null,
+        content_hash: log.contentHash ?? null,
       }));
 
       await this.client.insert({
@@ -98,8 +153,10 @@ export class ClickHouseAdapter implements IAdapter {
       });
 
       return true;
-    } catch {
-      return false;
+    } catch (err) {
+      throw err instanceof Error
+        ? err
+        : new Error(`ClickHouseAdapter.bulkInsert failed: ${String(err)}`);
     }
   }
 
@@ -116,8 +173,6 @@ export class ClickHouseAdapter implements IAdapter {
     if (tenantId !== null) {
       conditions.push('tenant_id = {tenant_id:String}');
       params['tenant_id'] = tenantId;
-    } else {
-      // In single_database mode with no tenant, don't filter by tenant_id
     }
     if (filters.action) {
       conditions.push('action = {action:String}');
@@ -132,12 +187,12 @@ export class ClickHouseAdapter implements IAdapter {
       params['entity_id'] = filters.entityId;
     }
     if (filters.startDate) {
-      conditions.push('created_at >= {start_date:DateTime}');
-      params['start_date'] = filters.startDate;
+      conditions.push('created_at >= {start_date:DateTime64(3)}');
+      params['start_date'] = toClickHouseDateTime(filters.startDate);
     }
     if (filters.endDate) {
-      conditions.push('created_at <= {end_date:DateTime}');
-      params['end_date'] = filters.endDate;
+      conditions.push('created_at <= {end_date:DateTime64(3)}');
+      params['end_date'] = toClickHouseDateTime(filters.endDate);
     }
     if (pagination.cursor) {
       conditions.push('id < {cursor:String}');
@@ -148,8 +203,11 @@ export class ClickHouseAdapter implements IAdapter {
     const fetchLimit = pagination.limit + 1;
     params['fetch_limit'] = fetchLimit;
 
+    const useFinal = this.config.queryFinal !== false;
+    const fromClause = useFinal ? 'audit_logs FINAL' : 'audit_logs';
+
     const result = await this.client.query({
-      query: `SELECT * FROM audit_logs ${where} ORDER BY id DESC LIMIT {fetch_limit:UInt32}`,
+      query: `SELECT * FROM ${fromClause} ${where} ORDER BY id DESC LIMIT {fetch_limit:UInt32}`,
       query_params: params,
       format: 'JSONEachRow',
     });
@@ -164,12 +222,14 @@ export class ClickHouseAdapter implements IAdapter {
       actorId: row['actor_id'] as string,
       action: row['action'] as string,
       entityId: (row['entity_id'] as string) ?? undefined,
-      oldValues: row['old_values'] ? JSON.parse(row['old_values'] as string) as Record<string, unknown> : undefined,
-      newValues: row['new_values'] ? JSON.parse(row['new_values'] as string) as Record<string, unknown> : undefined,
-      metadata: row['metadata'] ? JSON.parse(row['metadata'] as string) as Record<string, unknown> : undefined,
+      oldValues: safeJsonParse<Record<string, unknown>>(row['old_values']),
+      newValues: safeJsonParse<Record<string, unknown>>(row['new_values']),
+      metadata: safeJsonParse<Record<string, unknown>>(row['metadata']),
       ipAddress: (row['ip_address'] as string) ?? undefined,
       userAgent: (row['user_agent'] as string) ?? undefined,
-      createdAt: row['created_at'] as string,
+      createdAt: String(row['created_at'] ?? ''),
+      prevHash: (row['prev_hash'] as string) || undefined,
+      contentHash: (row['content_hash'] as string) || undefined,
     }));
 
     const lastLog = logs[logs.length - 1];
@@ -181,28 +241,40 @@ export class ClickHouseAdapter implements IAdapter {
 
   /**
    * Prune expired data using ALTER TABLE DROP PARTITION for O(1) removal.
-   * Falls back to TTL as secondary safety net.
+   *
+   * Month granularity: partitions are toYYYYMM, so we only DROP whole months
+   * strictly older than the cutoff month (partitionNum < cutoffYYYYMM). The
+   * current cutoff month is left intact — partial-month cleanup is handled by
+   * the table TTL (created_at + INTERVAL retentionDays DAY DELETE) as a safety
+   * net. Partition names are validated as YYYYMM; database is scoped. Cutoff uses UTC.
    */
   async prune(days: number): Promise<void> {
     if (!this.client) return;
 
-    // Calculate the oldest year-month partition that should be kept
     const cutoffDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-    const cutoffYYYYMM = cutoffDate.getFullYear() * 100 + (cutoffDate.getMonth() + 1);
+    // YYYYMM safety: only numeric 6-digit partitions strictly before cutoff month
+    const cutoffYYYYMM =
+      cutoffDate.getUTCFullYear() * 100 + (cutoffDate.getUTCMonth() + 1);
 
-    // Get all existing partitions
     const result = await this.client.query({
-      query: `SELECT DISTINCT partition FROM system.parts WHERE table = 'audit_logs' AND active = 1`,
+      query: `
+        SELECT DISTINCT partition
+        FROM system.parts
+        WHERE database = {db:String}
+          AND table = 'audit_logs'
+          AND active = 1
+      `,
+      query_params: { db: this.database },
       format: 'JSONEachRow',
     });
 
     const partitions = await result.json<{ partition: string }[]>();
 
-    // Drop partitions that are fully expired
     for (const { partition } of partitions) {
+      // YYYYMM safety: reject non-matching partition names
+      if (!/^\d{6}$/.test(partition)) continue;
       const partitionNum = parseInt(partition, 10);
-      // Validate partition format (YYYYMM) to prevent injection
-      if (!isNaN(partitionNum) && partitionNum < cutoffYYYYMM && /^\d{6}$/.test(partition)) {
+      if (!isNaN(partitionNum) && partitionNum < cutoffYYYYMM) {
         await this.client.command({
           query: `ALTER TABLE audit_logs DROP PARTITION '${partition}'`,
         });

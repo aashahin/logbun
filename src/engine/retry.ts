@@ -1,68 +1,77 @@
-import type { DLQStorage } from '../storage/dlq';
-import type { IAdapter, LogbunLog } from '../types';
+import {
+  tenantIdFromFilename,
+  type DLQStorage,
+} from '../storage/dlq';
+import type { IAdapter, LogbunEvent, LogbunLog, RetryConfig } from '../types';
 import type { ConnectionPool } from './pool';
+import { safeEmit, type LogbunEventHandler } from '../events';
+
+const DEFAULT_MAX_SCAN_ATTEMPTS = 10;
+/** insertMaxRetries = total bulkInsert attempts (default 3). */
+const DEFAULT_INSERT_MAX_RETRIES = 3;
+const DEFAULT_INSERT_BASE_DELAY_MS = 1_000;
+const DEFAULT_SCAN_INTERVAL_MS = 60_000;
+/** Max pending DLQ files processed concurrently per scan. */
+const PROCESS_CONCURRENCY = 4;
+
+/** Constructor deps for {@link RetryEngine}. */
+export interface RetryEngineDeps {
+  dlq: DLQStorage;
+  adapter: IAdapter;
+  pool: ConnectionPool;
+  retry?: RetryConfig;
+  onEvent?: LogbunEventHandler;
+}
 
 /**
  * DLQ Retry Engine — processes failed batches with exponential backoff.
  *
- * Scans the DLQ directory for pending .batch files and attempts to
- * re-insert them via the adapter. Uses atomic file rename to prevent
- * race conditions.
- *
- * Backoff schedule per batch (within a single scan):
- *   Attempt 1: immediate
- *   Attempt 2: wait 1s → retry
- *   Attempt 3: wait 2s → retry
- *   Attempt 4: wait 4s → retry → GIVE UP for this scan
- *
- * Poison pill: after MAX_SCAN_ATTEMPTS total scan-level failures,
- * the batch is moved to .dead to prevent infinite retry loops.
+ * Poison pill uses the durable envelope `attempts` field only (survives restarts).
+ * Tenant adapters never fall back to the base adapter.
  */
 export class RetryEngine {
   private readonly dlq: DLQStorage;
   private readonly pool: ConnectionPool;
   private readonly adapter: IAdapter;
+  private readonly onEvent?: LogbunEventHandler;
+  private readonly scanInterval: number;
+  private readonly maxScanAttempts: number;
+  private readonly insertMaxRetries: number;
+  private readonly insertBaseDelayMs: number;
+
   private intervalTimer: ReturnType<typeof setInterval> | null = null;
   private initialTimer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
 
-  /** Retry scan interval in milliseconds. Default: 60s */
-  private readonly scanInterval: number;
-
-  /**
-   * Tracks how many scan-level failures each batch file has accumulated.
-   * Key: base filename (without directory path), Value: failure count.
-   * Reset on successful processing or process restart.
-   */
-  private readonly failureCounts: Map<string, number> = new Map();
-
-  /** Maximum scan-level failures before a batch is poisoned */
-  private static readonly MAX_SCAN_ATTEMPTS = 10;
-
-  constructor(dlq: DLQStorage, adapter: IAdapter, pool: ConnectionPool, scanInterval: number = 60_000) {
-    this.dlq = dlq;
-    this.adapter = adapter;
-    this.pool = pool;
-    this.scanInterval = scanInterval;
+  constructor(deps: RetryEngineDeps) {
+    this.dlq = deps.dlq;
+    this.adapter = deps.adapter;
+    this.pool = deps.pool;
+    this.scanInterval = deps.retry?.scanIntervalMs ?? DEFAULT_SCAN_INTERVAL_MS;
+    this.maxScanAttempts =
+      deps.retry?.maxScanAttempts ?? DEFAULT_MAX_SCAN_ATTEMPTS;
+    this.insertMaxRetries =
+      deps.retry?.insertMaxRetries ?? DEFAULT_INSERT_MAX_RETRIES;
+    this.insertBaseDelayMs =
+      deps.retry?.insertBaseDelayMs ?? DEFAULT_INSERT_BASE_DELAY_MS;
+    this.onEvent = deps.onEvent;
   }
 
-  /**
-   * Start the retry engine with an initial delay.
-   * Gives network connections time to stabilize before retrying.
-   */
-  start(initialDelayMs: number = 10_000): void {
-    // Schedule first scan after initial delay
+  private emit(e: LogbunEvent): void {
+    safeEmit(this.onEvent, e);
+  }
+
+  start(initialDelayMs?: number): void {
+    const delay = initialDelayMs ?? 10_000;
     this.initialTimer = setTimeout(() => {
       this.initialTimer = null;
       void this.scan();
-      // Then schedule periodic scans
       this.intervalTimer = setInterval(() => {
         void this.scan();
       }, this.scanInterval);
-    }, initialDelayMs);
+    }, delay);
   }
 
-  /** Stop the retry engine — clears both initial timeout and periodic interval */
   stop(): void {
     if (this.initialTimer) {
       clearTimeout(this.initialTimer);
@@ -74,115 +83,192 @@ export class RetryEngine {
     }
   }
 
-  /** Run a single scan of the DLQ and attempt to process pending batches */
   async scan(): Promise<void> {
-    // Prevent overlapping scans
     if (this.running) return;
     this.running = true;
-
     try {
       const pending = await this.dlq.listPending();
-
-      for (const filePath of pending) {
-        await this.processBatch(filePath);
+      // Bounded parallel: process up to PROCESS_CONCURRENCY files at a time
+      for (let i = 0; i < pending.length; i += PROCESS_CONCURRENCY) {
+        const chunk = pending.slice(i, i + PROCESS_CONCURRENCY);
+        await Promise.allSettled(
+          chunk.map((filePath) => this.processBatch(filePath))
+        );
       }
     } finally {
       this.running = false;
     }
   }
 
-  /**
-   * Process a single batch file with exponential backoff.
-   * Max 3 retries (1s, 2s, 4s) before giving up for this scan cycle.
-   * After MAX_SCAN_ATTEMPTS total failures, the batch is poisoned.
-   */
   private async processBatch(filePath: string): Promise<void> {
-    const baseFilename = filePath.split('/').pop() ?? '';
-
-    // Check if this batch has exceeded max scan-level attempts
-    const priorFailures = this.failureCounts.get(baseFilename) ?? 0;
-    if (priorFailures >= RetryEngine.MAX_SCAN_ATTEMPTS) {
-      // Poison pill — move to .dead to stop retrying
-      try {
-        const processingPath = await this.dlq.markProcessing(filePath);
-        await this.dlq.markPoisoned(processingPath);
-        this.failureCounts.delete(baseFilename);
-      } catch {
-        // File may have been picked up by another scan — skip
-      }
-      return;
-    }
-
     let processingPath: string;
     try {
       processingPath = await this.dlq.markProcessing(filePath);
     } catch {
-      // File may have been picked up by another scan — skip
       return;
     }
 
+    let logs: LogbunLog[] = [];
+    let tenantId: string | null = null;
+    let attempts = 0;
+
     try {
-      // Parse the batch file
-      const file = Bun.file(processingPath);
-      const content = await file.text();
-      const logs: LogbunLog[] = JSON.parse(content) as LogbunLog[];
+      const batch = await this.dlq.readBatchFile(processingPath);
+      logs = batch.logs;
+      // Prefer envelope tenantId (raw) over sanitized filename key
+      tenantId = batch.tenantId ?? tenantIdFromFilename(processingPath);
+      attempts =
+        typeof batch.attempts === 'number' && Number.isFinite(batch.attempts)
+          ? batch.attempts
+          : 0;
 
-      // Extract tenantId from the filename: {tenantId}_{timestamp}_{rand}.batch.processing
-      // TenantId may contain underscores (e.g. "tenant_123"), so we split and
-      // pop the last two segments (rand.batch.processing + timestamp), rejoin the rest.
-      const filename = processingPath.split('/').pop() ?? '';
-      const segments = filename.split('_');
-      // Remove the "{rand}.batch.processing" segment
-      segments.pop();
-      // Remove the "{timestamp}" segment
-      segments.pop();
-      const tenantIdRaw = segments.join('_');
-      const tenantId = tenantIdRaw === '__global__' ? null : (tenantIdRaw || null);
-
-      // Get the correct adapter via pool (for database_per_tenant support)
-      let targetAdapter: IAdapter;
-      if (tenantId) {
-        try {
-          targetAdapter = await this.pool.get(tenantId);
-        } catch {
-          targetAdapter = this.adapter;
-        }
-      } else {
-        targetAdapter = this.adapter;
+      if (attempts >= this.maxScanAttempts) {
+        await this.poison(processingPath, tenantId, attempts, filePath);
+        return;
       }
 
-      // Exponential backoff retry
-      const maxRetries = 3;
-      const baseDelay = 1000;
-
-      for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        if (attempt > 0) {
-          // Wait with exponential backoff: 1s, 2s, 4s
-          const delay = baseDelay * Math.pow(2, attempt - 1);
-          await new Promise((resolve) => setTimeout(resolve, delay));
-        }
-
-        const success = await targetAdapter.bulkInsert(tenantId, logs);
-        if (success) {
-          await this.dlq.markDone(processingPath);
-          // Clear failure count on success
-          this.failureCounts.delete(baseFilename);
-          return;
-        }
+      if (!Array.isArray(logs) || logs.length === 0) {
+        await this.poison(
+          processingPath,
+          tenantId,
+          attempts,
+          'empty_or_invalid'
+        );
+        return;
       }
 
-      // All retries exhausted — put back in DLQ for next scan cycle
-      await this.dlq.markFailed(processingPath);
-      // Increment failure count
-      this.failureCounts.set(baseFilename, priorFailures + 1);
+      const insertResult = await this.insertWithAdapter(
+        tenantId,
+        processingPath,
+        attempts,
+        logs
+      );
+      if (!insertResult) return;
+
+      const { ok, error } = insertResult;
+      if (ok) {
+        await this.dlq.markDone(processingPath);
+        this.emit({
+          type: 'flush_ok',
+          tenantId,
+          count: logs.length,
+          detail: 'dlq_retry',
+        });
+        return;
+      }
+
+      await this.failWithAttempts(processingPath, attempts);
+      if (error) {
+        this.emit({
+          type: 'flush_fail',
+          tenantId,
+          count: logs.length,
+          error,
+          detail: 'dlq_retry',
+        });
+      }
     } catch {
-      // Parse error or unexpected failure — put back in DLQ
       try {
-        await this.dlq.markFailed(processingPath);
-        this.failureCounts.set(baseFilename, priorFailures + 1);
+        await this.failWithAttempts(processingPath, attempts);
       } catch {
-        // File system error — nothing we can do
+        // nothing we can do
       }
+    }
+  }
+
+  /**
+   * Resolve adapter and bulk-insert. Never falls back to base for a tenant.
+   * @returns null when tenant adapter resolution failed (already re-queued)
+   */
+  private async insertWithAdapter(
+    tenantId: string | null,
+    processingPath: string,
+    attempts: number,
+    logs: LogbunLog[]
+  ): Promise<{ ok: boolean; error?: string } | null> {
+    if (!tenantId) {
+      return this.bulkInsertWithBackoff(this.adapter, null, logs);
+    }
+
+    try {
+      return await this.pool.withAdapter(tenantId, (adapter) =>
+        this.bulkInsertWithBackoff(adapter, tenantId, logs)
+      );
+    } catch (err) {
+      // Never fall back to base adapter for a real tenant
+      await this.failWithAttempts(processingPath, attempts);
+      this.emit({
+        type: 'flush_fail',
+        tenantId,
+        count: logs.length,
+        error: err instanceof Error ? err.message : String(err),
+        detail: 'tenant_adapter',
+      });
+      return null;
+    }
+  }
+
+  /**
+   * bulkInsert with exponential backoff.
+   * insertMaxRetries is the **total** number of attempts (default 3).
+   * Delays apply between retries only.
+   */
+  private async bulkInsertWithBackoff(
+    adapter: IAdapter,
+    tenantId: string | null,
+    logs: LogbunLog[]
+  ): Promise<{ ok: boolean; error?: string }> {
+    const maxAttempts = Math.max(1, this.insertMaxRetries);
+    let lastError: string | undefined;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (attempt > 0) {
+        const delay = this.insertBaseDelayMs * Math.pow(2, attempt - 1);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+      try {
+        if (await adapter.bulkInsert(tenantId, logs)) {
+          return { ok: true };
+        }
+        lastError = lastError ?? 'bulkInsert returned false';
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+      }
+    }
+    return { ok: false, error: lastError };
+  }
+
+  private async poison(
+    processingPath: string,
+    tenantId: string | null,
+    attempts: number,
+    detail: string
+  ): Promise<void> {
+    try {
+      await this.dlq.markPoisoned(processingPath);
+      this.emit({
+        type: 'poison',
+        tenantId,
+        count: attempts,
+        detail,
+      });
+    } catch {
+      // ignore
+    }
+  }
+
+  private async failWithAttempts(
+    processingPath: string,
+    currentAttempts: number
+  ): Promise<void> {
+    try {
+      await this.dlq.incrementAttempts(processingPath, currentAttempts);
+    } catch {
+      // still try to re-queue
+    }
+    try {
+      await this.dlq.markFailed(processingPath);
+    } catch {
+      // filesystem error
     }
   }
 }

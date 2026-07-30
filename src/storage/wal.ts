@@ -1,93 +1,494 @@
 import type { LogbunLog } from '../types';
-import { mkdir } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { resolveLogbunDir } from '../utils/path';
+import {
+  decryptUtf8,
+  encryptUtf8,
+  type EncryptionKeyBytes,
+} from '../utils/crypto';
+import {
+  appendFile,
+  mkdir,
+  open,
+  readdir,
+  rename,
+  stat,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { createInterface } from 'node:readline';
+import { join } from 'node:path';
+
+/** Soft-size hint (64 MiB). Default maxWalBytes / hard refuse threshold. */
+export const WAL_SIZE_SOFT_LIMIT_BYTES = 64 * 1024 * 1024;
+
+/** Default sealed segment size before rotating `current.aof`. */
+export const WAL_SEGMENT_BYTES_DEFAULT = 16 * 1024 * 1024;
+
+export interface WALStorageOptions {
+  /**
+   * fsync after append and after compact rewrite.
+   * @default true
+   */
+  fsync?: boolean;
+  /**
+   * Compact when this many ack ids sit in the sidecar.
+   * @default 256
+   */
+  compactAckThreshold?: number;
+  /**
+   * Hard size limit in bytes across all segments + current.
+   * When `hardMaxBytes` is true (default), append throws `wal_full` if already at/over limit.
+   * @default {@link WAL_SIZE_SOFT_LIMIT_BYTES} (64 MiB)
+   */
+  maxBytes?: number;
+  /** Alias for {@link WALStorageOptions.maxBytes}. */
+  maxWalBytes?: number;
+  /**
+   * When true (default), refuse append once total size >= maxBytes (`wal_full`).
+   * Batcher treats this like any WAL append failure (DLQ fallback).
+   * @default true
+   */
+  hardMaxBytes?: boolean;
+  /**
+   * Rotate `current.aof` into a sealed segment when it reaches this size.
+   * Keeps compact/read peak memory closer to segment size, not total WAL size.
+   * @default 16 MiB
+   */
+  segmentBytes?: number;
+  /** Optional AES-256-GCM key (32 raw bytes after normalize). */
+  encryptionKey?: EncryptionKeyBytes;
+}
+
+/** Options for {@link WALStorage.readAllBounded}. */
+export interface WALReadBoundedOptions {
+  maxLogs?: number;
+  maxBytes?: number;
+}
+
+export interface WALReadBoundedResult {
+  logs: LogbunLog[];
+  truncated: boolean;
+  approxBytes: number;
+}
 
 /**
- * Write-Ahead Log — Append-only NDJSON file.
+ * Write-Ahead Log — segmented append-only NDJSON + ack sidecar.
  *
- * Format: one JSON object per line, terminated by \n.
- * Uses Bun.file().writer() for buffered append-only writes — fastest
- * possible I/O pattern (no seek, no read, no transaction).
+ * Layout under `{dataDir}/{namespace}/wal/`:
+ * - `current.aof` — active append target
+ * - `seg-NNNNNN.aof` — sealed segments (rotation)
+ * - `acked.ids` — append-only ack sidecar
+ *
+ * Compact rewrites segment-by-segment (bounded peak memory ≈ segment size).
+ * All mutations serialized via `runExclusive`.
  */
 export class WALStorage {
+  private readonly dir: string;
   private readonly path: string;
-  private writer: ReturnType<ReturnType<typeof Bun.file>['writer']> | null = null;
+  private readonly ackPath: string;
+  private readonly fsync: boolean;
+  private readonly compactAckThreshold: number;
+  private readonly maxBytes: number;
+  private readonly hardMaxBytes: boolean;
+  private readonly segmentBytes: number;
+  private readonly encryptionKey?: EncryptionKeyBytes;
+  private ready = false;
+  private pendingAckCount = 0;
+  private opChain: Promise<void> = Promise.resolve();
+  /** Next segment sequence number (monotonic). */
+  private nextSeg = 1;
 
-  constructor(namespace: string) {
-    this.path = `.logbun/${namespace}/wal/current.aof`;
+  constructor(
+    namespace: string,
+    dataDir?: string,
+    options?: WALStorageOptions
+  ) {
+    this.dir = join(resolveLogbunDir(namespace, dataDir), 'wal');
+    this.path = join(this.dir, 'current.aof');
+    this.ackPath = join(this.dir, 'acked.ids');
+    this.fsync = options?.fsync ?? true;
+    this.compactAckThreshold = options?.compactAckThreshold ?? 256;
+    this.maxBytes =
+      options?.maxBytes ??
+      options?.maxWalBytes ??
+      WAL_SIZE_SOFT_LIMIT_BYTES;
+    this.hardMaxBytes = options?.hardMaxBytes !== false;
+    // Allow small segmentBytes in tests; production default is 16 MiB.
+    this.segmentBytes = Math.max(
+      256,
+      options?.segmentBytes ?? WAL_SEGMENT_BYTES_DEFAULT
+    );
+    this.encryptionKey = options?.encryptionKey;
   }
 
-  /** Ensure the WAL directory exists and open the writer */
+  get softMaxBytes(): number {
+    return this.maxBytes;
+  }
+
+  get walDir(): string {
+    return this.dir;
+  }
+
+  private runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.opChain.then(fn, fn);
+    this.opChain = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
   async init(): Promise<void> {
-    await mkdir(dirname(this.path), { recursive: true });
-    // Touch the file if it doesn't exist
+    await mkdir(this.dir, { recursive: true });
     const file = Bun.file(this.path);
     if (!(await file.exists())) {
-      await Bun.write(this.path, '');
+      await writeFile(this.path, '');
     }
-    this.writer = file.writer();
-  }
-
-  /** Append a single log entry as NDJSON */
-  async append(log: LogbunLog): Promise<void> {
-    if (!this.writer) {
-      throw new Error('WAL not initialized — call init() first');
+    const ackFile = Bun.file(this.ackPath);
+    if (!(await ackFile.exists())) {
+      await writeFile(this.ackPath, '');
+    } else {
+      const text = await ackFile.text();
+      this.pendingAckCount = text
+        .split('\n')
+        .filter((l) => l.trim().length > 0).length;
     }
-    const line = JSON.stringify(log) + '\n';
-    this.writer.write(line);
-    await this.writer.flush();
+    // Discover highest sealed segment index
+    try {
+      const entries = await readdir(this.dir);
+      let max = 0;
+      for (const e of entries) {
+        const m = /^seg-(\d+)\.aof$/.exec(e);
+        if (m) {
+          const n = parseInt(m[1]!, 10);
+          if (n > max) max = n;
+        }
+      }
+      this.nextSeg = max + 1;
+    } catch {
+      this.nextSeg = 1;
+    }
+    this.ready = true;
   }
 
   /**
-   * Read all log entries from the WAL.
-   * Used only during bootstrap recovery. Silently discards malformed
-   * partial writes from a previous crash.
+   * Append a log line.
+   * @throws Error with message containing `wal_full` when hard max is enabled
+   *         and total on-disk size is already >= maxBytes.
    */
+  async append(log: LogbunLog): Promise<void> {
+    return this.runExclusive(async () => {
+      if (!this.ready) {
+        throw new Error('WAL not initialized — call init() first');
+      }
+
+      const total = await this.sizeOfAllUnlocked();
+      if (this.hardMaxBytes && total >= this.maxBytes) {
+        throw new Error(
+          `wal_full: WAL size ${total} >= maxBytes ${this.maxBytes}`
+        );
+      }
+
+      // Rotate current into a sealed segment when large enough
+      const currentSize = await this.sizeOfFileUnlocked(this.path);
+      if (currentSize >= this.segmentBytes) {
+        await this.rotateCurrentUnlocked();
+      }
+
+      const plain = JSON.stringify(log);
+      const line = this.encryptionKey
+        ? await encryptUtf8(plain, this.encryptionKey)
+        : plain;
+      await appendFile(this.path, line + '\n');
+      if (this.fsync) {
+        await this.fsyncFile(this.path);
+      }
+    });
+  }
+
   async readAll(): Promise<LogbunLog[]> {
-    const file = Bun.file(this.path);
-    if (!(await file.exists())) return [];
+    const result = await this.readAllBounded();
+    return result.logs;
+  }
 
-    const content = await file.text();
-    if (!content.trim()) return [];
+  async readAllBounded(
+    maxLogsOrOpts?: number | WALReadBoundedOptions
+  ): Promise<WALReadBoundedResult> {
+    let maxLogs: number | undefined;
+    if (typeof maxLogsOrOpts === 'number') {
+      maxLogs = maxLogsOrOpts;
+    } else if (maxLogsOrOpts && typeof maxLogsOrOpts === 'object') {
+      maxLogs = maxLogsOrOpts.maxLogs;
+    }
+    return this.runExclusive(() => this.readPendingBoundedUnlocked(maxLogs));
+  }
 
-    const lines = content.split('\n');
-    const logs: LogbunLog[] = [];
+  async approximateSize(): Promise<number> {
+    return this.sizeOfAllUnlocked();
+  }
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
+  async acknowledge(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+
+    return this.runExclusive(async () => {
+      const unique = [...new Set(ids)];
+      const body = unique.map((id) => id + '\n').join('');
+      await appendFile(this.ackPath, body);
+      if (this.fsync) {
+        await this.fsyncFile(this.ackPath);
+      }
+      this.pendingAckCount += unique.length;
+
+      if (this.pendingAckCount >= this.compactAckThreshold) {
+        await this.compactUnlocked();
+      }
+    });
+  }
+
+  /**
+   * Compact segment-by-segment (peak memory ~ one segment of unacked logs).
+   * Never deletes unacked entries.
+   */
+  async compact(): Promise<void> {
+    return this.runExclusive(() => this.compactUnlocked());
+  }
+
+  /** @deprecated Prefer {@link compact}. */
+  async truncate(): Promise<void> {
+    return this.runExclusive(async () => {
+      const pending = await this.readPendingUnlocked();
+      if (pending.length === 0) {
+        await this.clearAllSegmentsUnlocked();
+        await writeFile(this.ackPath, '');
+        this.pendingAckCount = 0;
+        if (this.fsync) {
+          await this.fsyncFile(this.path);
+          await this.fsyncFile(this.ackPath);
+        }
+      } else {
+        await this.compactUnlocked();
+      }
+    });
+  }
+
+  async close(): Promise<void> {
+    return this.runExclusive(async () => {
       try {
-        logs.push(JSON.parse(trimmed) as LogbunLog);
+        await this.compactUnlocked();
       } catch {
-        // Silently discard malformed partial writes
+        /* best-effort */
+      }
+      this.ready = false;
+    });
+  }
+
+  private async rotateCurrentUnlocked(): Promise<void> {
+    const size = await this.sizeOfFileUnlocked(this.path);
+    if (size === 0) return;
+    const segName = `seg-${String(this.nextSeg).padStart(6, '0')}.aof`;
+    const segPath = join(this.dir, segName);
+    this.nextSeg++;
+    await rename(this.path, segPath);
+    await writeFile(this.path, '');
+    if (this.fsync) {
+      await this.fsyncFile(this.path);
+    }
+  }
+
+  private async listSegmentPathsUnlocked(): Promise<string[]> {
+    let entries: string[];
+    try {
+      entries = await readdir(this.dir);
+    } catch {
+      return [];
+    }
+    return entries
+      .filter((e) => /^seg-\d+\.aof$/.test(e))
+      .sort()
+      .map((e) => join(this.dir, e));
+  }
+
+  private async aofPathsInOrderUnlocked(): Promise<string[]> {
+    const segs = await this.listSegmentPathsUnlocked();
+    return [...segs, this.path];
+  }
+
+  private async compactUnlocked(): Promise<void> {
+    const acked = await this.readAckedIdsUnlocked();
+    const paths = await this.aofPathsInOrderUnlocked();
+    const survivors: LogbunLog[] = [];
+
+    // Stream each file; keep only unacked. Peak = survivors array (still O(unacked)).
+    // Prefer rewriting per-segment when survivor count is large: rewrite each path alone.
+    for (const p of paths) {
+      const kept: LogbunLog[] = [];
+      await this.forEachLogLineUnlocked(p, (log) => {
+        if (!acked.has(log.id)) kept.push(log);
+      });
+      if (p === this.path) {
+        survivors.push(...kept);
+      } else if (kept.length === 0) {
+        try {
+          await unlink(p);
+        } catch {
+          /* ignore */
+        }
+      } else {
+        // Rewrite sealed segment in place (bounded to that segment's unacked set)
+        await this.rewrite(p, kept);
       }
     }
 
+    // Collapse remaining current + optionally merge small segs: rewrite current only
+    await this.rewrite(this.path, survivors);
+    // After compact, sealed segs that still exist are already filtered; current holds
+    // only what was in current. Optionally absorb tiny sealed segs into current later.
+
+    await writeFile(this.ackPath, '');
+    if (this.fsync) {
+      await this.fsyncFile(this.ackPath);
+    }
+    this.pendingAckCount = 0;
+  }
+
+  private async clearAllSegmentsUnlocked(): Promise<void> {
+    const segs = await this.listSegmentPathsUnlocked();
+    for (const p of segs) {
+      try {
+        await unlink(p);
+      } catch {
+        /* ignore */
+      }
+    }
+    await writeFile(this.path, '');
+  }
+
+  private async readPendingUnlocked(): Promise<LogbunLog[]> {
+    const { logs } = await this.readPendingBoundedUnlocked();
     return logs;
   }
 
-  /**
-   * Truncate the WAL to zero bytes after a successful recovery flush.
-   * Reuses the file (does not delete it).
-   */
-  async truncate(): Promise<void> {
-    // Close existing writer before truncating
-    if (this.writer) {
-      await this.writer.flush();
-      await this.writer.end();
-      this.writer = null;
+  private async readPendingBoundedUnlocked(
+    maxLogs?: number
+  ): Promise<WALReadBoundedResult> {
+    const approxBytes = await this.sizeOfAllUnlocked();
+    const acked = await this.readAckedIdsUnlocked();
+    const logs: LogbunLog[] = [];
+    let truncated = false;
+    const hasCap =
+      typeof maxLogs === 'number' && Number.isFinite(maxLogs) && maxLogs >= 0;
+
+    const paths = await this.aofPathsInOrderUnlocked();
+    outer: for (const p of paths) {
+      const stop = await this.forEachLogLineUnlocked(p, (log) => {
+        if (acked.has(log.id)) return 'continue';
+        if (hasCap && logs.length >= (maxLogs as number)) {
+          truncated = true;
+          return 'stop';
+        }
+        logs.push(log);
+        return 'continue';
+      });
+      if (stop || truncated) break outer;
     }
-    await Bun.write(this.path, '');
-    // Re-open writer
-    this.writer = Bun.file(this.path).writer();
+
+    return { logs, truncated, approxBytes };
   }
 
-  /** Close the writer — called during shutdown */
-  async close(): Promise<void> {
-    if (this.writer) {
-      await this.writer.flush();
-      await this.writer.end();
-      this.writer = null;
+  /**
+   * Stream parse lines from an AOF path.
+   * Callback returns `'stop'` to halt early. Returns true if stopped early.
+   */
+  private async forEachLogLineUnlocked(
+    filePath: string,
+    onLog: (log: LogbunLog) => 'continue' | 'stop' | void
+  ): Promise<boolean> {
+    const file = Bun.file(filePath);
+    if (!(await file.exists())) return false;
+
+    const stream = createReadStream(filePath, { encoding: 'utf8' });
+    const rl = createInterface({ input: stream, crlfDelay: Infinity });
+    try {
+      for await (const rawLine of rl) {
+        const trimmed = rawLine.trim();
+        if (!trimmed) continue;
+        let plain = trimmed;
+        try {
+          if (this.encryptionKey) {
+            plain = await decryptUtf8(trimmed, this.encryptionKey);
+          }
+          const log = JSON.parse(plain) as LogbunLog;
+          if (onLog(log) === 'stop') return true;
+        } catch {
+          // Discard malformed / decrypt failures for partial crash lines
+          continue;
+        }
+      }
+    } finally {
+      rl.close();
+      stream.destroy();
+    }
+    return false;
+  }
+
+  private async sizeOfAllUnlocked(): Promise<number> {
+    const paths = await this.aofPathsInOrderUnlocked();
+    let total = 0;
+    for (const p of paths) {
+      total += await this.sizeOfFileUnlocked(p);
+    }
+    return total;
+  }
+
+  private async sizeOfFileUnlocked(filePath: string): Promise<number> {
+    try {
+      // Prefer node:fs stat — Bun.file().size can lag behind appendFile writes
+      const st = await stat(filePath);
+      return typeof st.size === 'number' && Number.isFinite(st.size) ? st.size : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private async readAckedIdsUnlocked(): Promise<Set<string>> {
+    const file = Bun.file(this.ackPath);
+    if (!(await file.exists())) return new Set();
+    const content = await file.text();
+    if (!content.trim()) return new Set();
+    const set = new Set<string>();
+    for (const line of content.split('\n')) {
+      const id = line.trim();
+      if (id) set.add(id);
+    }
+    return set;
+  }
+
+  private async rewrite(path: string, logs: LogbunLog[]): Promise<void> {
+    const lines: string[] = [];
+    for (const l of logs) {
+      const plain = JSON.stringify(l);
+      if (this.encryptionKey) {
+        lines.push(await encryptUtf8(plain, this.encryptionKey));
+      } else {
+        lines.push(plain);
+      }
+    }
+    const body = lines.length === 0 ? '' : lines.join('\n') + '\n';
+    const tempPath = `${path}.tmp`;
+    await writeFile(tempPath, body);
+    if (this.fsync) {
+      await this.fsyncFile(tempPath);
+    }
+    await rename(tempPath, path);
+  }
+
+  private async fsyncFile(filePath: string): Promise<void> {
+    const fh = await open(filePath, 'r+');
+    try {
+      await fh.sync();
+    } finally {
+      await fh.close();
     }
   }
 }
