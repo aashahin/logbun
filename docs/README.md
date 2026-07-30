@@ -12,4 +12,4 @@ In-depth guides for the **logbun** package. Start with the root [README](../READ
 | [Plugins](./plugins.md) | Elysia & Hono, IP trust model |
 | [Changelog notes](./changelog-notes.md) | Capability history (what the library includes today) |
 
-**Runtime:** Bun ≥ 1.3.0 · **Package version:** see `package.json` (`0.2.0` at time of writing).
+**Runtime:** Bun ≥ 1.3.0 · **Package version:** see `package.json` (`0.2.1` at time of writing).

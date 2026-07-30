@@ -59,31 +59,36 @@ export const auditPlugin = <T extends string>(
   const trustedProxyCount = opts?.trustedProxyCount ?? 0;
   const getTenantId = opts?.getTenantId;
 
-  return new Elysia({ name: 'logbun' }).derive(({ request }) => {
-    const requestContext = {
-      ipAddress: extractClientIp(
-        (name) => request.headers.get(name),
-        trustedProxyCount
-      ),
-      userAgent: request.headers.get('user-agent') ?? undefined,
-    };
+  // `as: 'global'` is required so parent apps that `.use(auditPlugin(...))`
+  // see `auditLog` on the request context (Elysia local derive stays isolated).
+  return new Elysia({ name: 'logbun' }).derive(
+    { as: 'global' },
+    ({ request }) => {
+      const requestContext = {
+        ipAddress: extractClientIp(
+          (name) => request.headers.get(name),
+          trustedProxyCount
+        ),
+        userAgent: request.headers.get('user-agent') ?? undefined,
+      };
 
-    const withTenant = (
-      input: Omit<LogbunLogInput<T>, 'action'>
-    ): Omit<LogbunLogInput<T>, 'action'> => {
-      if (isTenantIdPresent(input.tenantId) || !getTenantId) return input;
-      const tenantId = getTenantId({ request });
-      if (!isTenantIdPresent(tenantId)) return input;
-      return { ...input, tenantId };
-    };
+      const withTenant = (
+        input: Omit<LogbunLogInput<T>, 'action'>
+      ): Omit<LogbunLogInput<T>, 'action'> => {
+        if (isTenantIdPresent(input.tenantId) || !getTenantId) return input;
+        const tenantId = getTenantId({ request });
+        if (!isTenantIdPresent(tenantId)) return input;
+        return { ...input, tenantId };
+      };
 
-    return {
-      auditLog: {
-        fire: (action: T, input: Omit<LogbunLogInput<T>, 'action'>) =>
-          logger.fire(action, withTenant(input), requestContext),
-        fireAsync: (action: T, input: Omit<LogbunLogInput<T>, 'action'>) =>
-          logger.fireAsync(action, withTenant(input), requestContext),
-      },
-    };
-  });
+      return {
+        auditLog: {
+          fire: (action: T, input: Omit<LogbunLogInput<T>, 'action'>) =>
+            logger.fire(action, withTenant(input), requestContext),
+          fireAsync: (action: T, input: Omit<LogbunLogInput<T>, 'action'>) =>
+            logger.fireAsync(action, withTenant(input), requestContext),
+        },
+      };
+    }
+  );
 };

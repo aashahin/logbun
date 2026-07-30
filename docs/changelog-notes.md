@@ -1,6 +1,6 @@
 # Capability notes (current library surface)
 
-This page summarizes what the library includes **today** (package `0.2.0`), spanning early design plus production hardening. It is not a dated Git changelog; use `git log` for commit history.
+This page summarizes what the library includes **today** (package `0.2.1`), spanning early design plus production hardening. It is not a dated Git changelog; use `git log` for commit history.
 
 ## Core product
 
@@ -84,6 +84,7 @@ This page summarizes what the library includes **today** (package `0.2.0`), span
 ## Plugins
 
 - Elysia derive plugin (`fire` + `fireAsync` + optional `getTenantId`)
+  - **0.2.1:** derive uses `{ as: 'global' }` so parent apps see `auditLog` after `.use(auditPlugin(...))`
 - Hono middleware + typed variables
 - IP off by default; `trustedProxyCount` trust model
 
@@ -102,6 +103,7 @@ Unit/integration coverage under `tests/` includes (non-exhaustive):
 - Query limit, path sanitize, client IP
 - Flush concurrency / chunk size, recovery caps
 - Production P0 / unsafe defaults
+- **0.2.1:** heavy E2E suites (`tests/e2e-*.test.ts`) — lifecycle, multi-tenant, DLQ/failure, safety, plugins (Hono/Elysia HTTP), stress
 
 ## Intentional non-goals (still)
 

@@ -82,4 +82,8 @@ test('bootstrap durable recovery keeps WAL until flush acknowledges', async () =
   await engine.batcher.flushAll();
   await engine.wal?.close();
   await engine.pool.closeAll();
+  // Release instance lock handle before afterEach deletes dataDir (avoids GC fd errors).
+  if (engine.instanceLock) {
+    await engine.instanceLock.release();
+  }
 });
