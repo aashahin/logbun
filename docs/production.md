@@ -26,6 +26,12 @@ isolate ends.
    encryption.
 6. Use a destination with idempotent insert by `LogbunLog.id`.
 
+With filesystem `fsync` enabled, first-run WAL initialization publishes file
+entries and newly created `wal`/namespace/`dataDir` entries child-before-parent.
+A permission-denied parent outside a narrow Deno grant is best-effort; every
+accessible level is still synced, and unexpected errors keep initialization
+unready until a retry succeeds.
+
 ## Maintenance and alerting
 
 Schedule `runMaintenance()` in every host. It performs a bounded unit of work:
@@ -82,5 +88,7 @@ validated ancestor in the interval before a path-based syscall. Put `dataDir`
 under OS permissions, a dedicated user/container, or another isolation boundary
 that excludes hostile writers. The instance lock coordinates cooperative
 owners and catches accidental namespace sharing; a same-user attacker can
-replace or remove it, and network filesystems may not provide the required
-exclusive-create or durability semantics.
+replace or remove it, including racing the final inode recheck and path-based
+unlink because portable runtimes expose no compare-and-unlink operation.
+Network filesystems may not provide the required exclusive-create or durability
+semantics.

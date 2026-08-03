@@ -46,6 +46,124 @@ test('WAL initialization syncs newly created file entries before becoming ready'
   await wal.close();
 });
 
+test('fresh WAL initialization publishes its hierarchy child before parent', async () => {
+  const rootParent = await mkdtemp(join(tmpdir(), 'logbun-wal-hierarchy-order-'));
+  cleanupPaths.push(rootParent);
+  const dataDir = join(rootParent, 'fresh-data');
+  const namespaceDir = join(dataDir, 'hierarchy-order');
+  const walDir = join(namespaceDir, 'wal');
+  const syncs: Array<{ directory: string; reason: string }> = [];
+  const wal = new WALStorage('hierarchy-order', dataDir, {
+    fsync: true,
+    directorySync: (directory, reason) => {
+      syncs.push({ directory, reason });
+    },
+  });
+
+  await wal.init();
+  expect(syncs).toEqual([
+    { directory: walDir, reason: 'initialize' },
+    { directory: namespaceDir, reason: 'initialize-hierarchy' },
+    { directory: dataDir, reason: 'initialize-hierarchy' },
+    { directory: rootParent, reason: 'initialize-hierarchy' },
+  ]);
+  await wal.close();
+});
+
+test('fresh WAL initialization publishes every recursively created dataDir ancestor', async () => {
+  const rootParent = await mkdtemp(join(tmpdir(), 'logbun-wal-hierarchy-nested-'));
+  cleanupPaths.push(rootParent);
+  const firstMissing = join(rootParent, 'missing-a');
+  const dataDir = join(firstMissing, 'missing-b');
+  const namespaceDir = join(dataDir, 'hierarchy-nested');
+  const walDir = join(namespaceDir, 'wal');
+  const syncs: Array<{ directory: string; reason: string }> = [];
+  const wal = new WALStorage('hierarchy-nested', dataDir, {
+    fsync: true,
+    directorySync: (directory, reason) => {
+      syncs.push({ directory, reason });
+    },
+  });
+
+  await wal.init();
+  expect(syncs).toEqual([
+    { directory: walDir, reason: 'initialize' },
+    { directory: namespaceDir, reason: 'initialize-hierarchy' },
+    { directory: dataDir, reason: 'initialize-hierarchy' },
+    { directory: firstMissing, reason: 'initialize-hierarchy' },
+    { directory: rootParent, reason: 'initialize-hierarchy' },
+  ]);
+  await wal.close();
+});
+
+test.each(['namespace', 'dataDir', 'parent'] as const)(
+  'WAL retains and retries unexpected %s hierarchy sync debt before admission',
+  async (level) => {
+    const rootParent = await mkdtemp(join(tmpdir(), `logbun-wal-hierarchy-${level}-`));
+    cleanupPaths.push(rootParent);
+    const dataDir = join(rootParent, 'fresh-data');
+    const namespaceDir = join(dataDir, `hierarchy-${level}`);
+    const targets = {
+      namespace: namespaceDir,
+      dataDir,
+      parent: rootParent,
+    };
+    const target = targets[level];
+    const syncs: Array<{ directory: string; reason: string }> = [];
+    let injectedFailure = false;
+    const wal = new WALStorage(`hierarchy-${level}`, dataDir, {
+      fsync: true,
+      directorySync: (directory, reason) => {
+        syncs.push({ directory, reason });
+        if (
+          !injectedFailure &&
+          directory === target &&
+          reason === 'initialize-hierarchy'
+        ) {
+          injectedFailure = true;
+          const error = new Error(`simulated ${level} hierarchy sync failure`) as NodeJS.ErrnoException;
+          error.code = 'EIO';
+          throw error;
+        }
+      },
+    });
+
+    await expect(wal.init()).rejects.toThrow(new RegExp(`${level} hierarchy sync failure`));
+    await expect(wal.append(log(`blocked-${level}`))).rejects.toThrow(/not initialized/);
+    const retryStart = syncs.length;
+    await expect(wal.init()).resolves.toBeUndefined();
+    expect(syncs[retryStart]).toEqual({
+      directory: target,
+      reason: 'initialize-hierarchy',
+    });
+    await expect(wal.append(log(`accepted-${level}`))).resolves.toBeUndefined();
+    await wal.close();
+  },
+);
+
+test('WAL treats a Deno capability denial at the dataDir parent as best-effort', async () => {
+  const rootParent = await mkdtemp(join(tmpdir(), 'logbun-wal-hierarchy-deno-'));
+  cleanupPaths.push(rootParent);
+  const dataDir = join(rootParent, 'fresh-data');
+  let parentAttempted = false;
+  const wal = new WALStorage('hierarchy-deno', dataDir, {
+    fsync: true,
+    directorySync: (directory, reason) => {
+      if (directory !== rootParent || reason !== 'initialize-hierarchy') return;
+      parentAttempted = true;
+      const error = new Error('parent is outside the Deno grant') as NodeJS.ErrnoException;
+      error.code = 'ERR_DENO_NOT_CAPABLE';
+      error.name = 'NotCapable';
+      throw error;
+    },
+  });
+
+  await expect(wal.init()).resolves.toBeUndefined();
+  expect(parentAttempted).toBe(true);
+  await expect(wal.append(log('deno-capability-boundary'))).resolves.toBeUndefined();
+  await wal.close();
+});
+
 test('WAL initialization retries unexpected directory-sync failure before becoming ready', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'logbun-wal-dir-sync-init-retry-'));
   cleanupPaths.push(dataDir);

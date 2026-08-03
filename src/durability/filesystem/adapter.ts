@@ -145,6 +145,7 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
       hardMaxBytes: this.walOpts.hardMaxBytes !== false,
       segmentBytes: this.walOpts.segmentBytes ?? WAL_SEGMENT_BYTES_DEFAULT,
       encryptionKey: encryptionKeyBytes,
+      createdHierarchyStart: this.lock?.createdHierarchyStart,
     };
     this.wal = new WALStorage(this.namespace, this.dataDir, walOptions);
     await this.wal.init();

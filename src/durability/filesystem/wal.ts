@@ -16,7 +16,7 @@ import {
 } from 'node:fs/promises';
 import { constants as FsConstants } from 'node:fs';
 import { Buffer } from 'node:buffer';
-import { basename, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { randomUUIDv7 } from '../../utils/uuidv7';
 
 
@@ -66,10 +66,13 @@ export interface WALStorageOptions {
     directory: string,
     reason: WALDirectorySyncReason,
   ) => void | Promise<void>;
+  /** @internal Earliest directory created by adapter setup before WAL init. */
+  createdHierarchyStart?: string;
 }
 
 export type WALDirectorySyncReason =
   | 'initialize'
+  | 'initialize-hierarchy'
   | 'rotate'
   | 'rewrite'
   | 'delete-segment';
@@ -91,6 +94,12 @@ export interface WALReadBoundedResult {
   logs: LogbunLog[];
   truncated: boolean;
   approxBytes: number;
+}
+
+interface PendingDirectorySync {
+  directory: string;
+  reason: WALDirectorySyncReason;
+  allowPermissionBoundary: boolean;
 }
 
 /**
@@ -116,7 +125,8 @@ export class WALStorage {
   private readonly segmentBytes: number;
   private readonly encryptionKey?: EncryptionKeyBytes;
   private readonly directorySync?: WALStorageOptions['directorySync'];
-  private pendingDirectorySync: WALDirectorySyncReason | null = null;
+  private readonly createdHierarchyStart?: string;
+  private pendingDirectorySyncs: PendingDirectorySync[] = [];
   private ready = false;
   private pendingAckCount = 0;
   private opChain: Promise<void> = Promise.resolve();
@@ -146,6 +156,9 @@ export class WALStorage {
     );
     this.encryptionKey = options?.encryptionKey;
     this.directorySync = options?.directorySync;
+    this.createdHierarchyStart = options?.createdHierarchyStart
+      ? resolve(options.createdHierarchyStart)
+      : undefined;
   }
 
   get softMaxBytes(): number {
@@ -174,13 +187,27 @@ export class WALStorage {
     return FsConstants.O_NOFOLLOW;
   }
 
-  private async syncDirectory(reason: WALDirectorySyncReason): Promise<void> {
+  private clearDirectorySyncDebt(
+    directory: string,
+    reason: WALDirectorySyncReason,
+  ): void {
+    const index = this.pendingDirectorySyncs.findIndex(
+      (pending) => pending.directory === directory && pending.reason === reason,
+    );
+    if (index >= 0) this.pendingDirectorySyncs.splice(index, 1);
+  }
+
+  private async syncDirectory(
+    directory: string,
+    reason: WALDirectorySyncReason,
+    allowPermissionBoundary = false,
+  ): Promise<void> {
     if (!this.fsync) return;
     try {
       if (this.directorySync) {
-        await this.directorySync(this.dir, reason);
+        await this.directorySync(directory, reason);
       } else {
-        const fh = await open(this.dir, FsConstants.O_RDONLY);
+        const fh = await open(directory, FsConstants.O_RDONLY);
         try {
           await fh.sync();
         } finally {
@@ -189,27 +216,52 @@ export class WALStorage {
       }
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (
+      const unsupported =
         WAL_DIRECTORY_FSYNC_UNSUPPORTED_CODES.includes(
           code as (typeof WAL_DIRECTORY_FSYNC_UNSUPPORTED_CODES)[number],
-        )
-      ) {
-        this.pendingDirectorySync = null;
+        );
+      const permissionBoundary =
+        allowPermissionBoundary &&
+        (code === 'EACCES' ||
+          code === 'ERR_DENO_NOT_CAPABLE' ||
+          (error as Error).name === 'NotCapable');
+      if (unsupported || permissionBoundary) {
+        this.clearDirectorySyncDebt(directory, reason);
         return;
       }
       throw error;
     }
-    this.pendingDirectorySync = null;
+    this.clearDirectorySyncDebt(directory, reason);
   }
 
-  private markDirectoryMutation(reason: WALDirectorySyncReason): void {
-    if (this.fsync) this.pendingDirectorySync = reason;
-  }
-
-  private async retryPendingDirectorySync(): Promise<void> {
-    if (this.pendingDirectorySync) {
-      await this.syncDirectory(this.pendingDirectorySync);
+  private markDirectoryMutation(
+    reason: WALDirectorySyncReason,
+    directory = this.dir,
+    allowPermissionBoundary = false,
+  ): void {
+    if (!this.fsync) return;
+    if (
+      this.pendingDirectorySyncs.some(
+        (pending) => pending.directory === directory && pending.reason === reason,
+      )
+    ) {
+      return;
     }
+    this.pendingDirectorySyncs.push({ directory, reason, allowPermissionBoundary });
+  }
+
+  private async retryPendingDirectorySync(): Promise<PendingDirectorySync[]> {
+    const retried: PendingDirectorySync[] = [];
+    while (this.pendingDirectorySyncs.length > 0) {
+      const pending = this.pendingDirectorySyncs[0]!;
+      await this.syncDirectory(
+        pending.directory,
+        pending.reason,
+        pending.allowPermissionBoundary,
+      );
+      retried.push(pending);
+    }
+    return retried;
   }
 
   private async assertSecureDirectory(): Promise<void> {
@@ -314,15 +366,66 @@ export class WALStorage {
   async init(): Promise<void> {
     await assertNoSymlinkPath(this.namespaceDir, 'WAL namespace path');
     await assertNoSymlinkPath(this.dir, 'WAL directory path');
-    await mkdir(this.dir, { recursive: true });
+    const walCreatedHierarchyStart = await mkdir(this.dir, { recursive: true });
     await this.assertSecureDirectory();
-    this.markDirectoryMutation('initialize');
-    await this.ensureSecureFile(this.path);
+    const retried = await this.retryPendingDirectorySync();
+    const currentCreated = await this.ensureSecureFile(this.path);
     const ackExisted = await this.secureFileExists(this.ackPath);
-    await this.ensureSecureFile(this.ackPath);
+    const ackCreated = await this.ensureSecureFile(this.ackPath);
     // Sync on every init so a retry or fresh instance settles directory-entry
     // mutations left behind by an earlier unexpected directory-sync failure.
-    await this.syncDirectory('initialize');
+    const retriedInitialization = retried.some(
+      (pending) => pending.directory === this.dir && pending.reason === 'initialize',
+    );
+    if (!retriedInitialization || currentCreated || ackCreated) {
+      this.markDirectoryMutation('initialize');
+      await this.syncDirectory(this.dir, 'initialize');
+    }
+
+    const dataDir = dirname(this.namespaceDir);
+    const createdStart = this.createdHierarchyStart ?? walCreatedHierarchyStart;
+    const outermostTarget = createdStart
+      ? dirname(resolve(createdStart))
+      : dirname(dataDir);
+    const hierarchy: Array<{
+      directory: string;
+      allowPermissionBoundary: boolean;
+    }> = [];
+    let hierarchyDirectory = this.namespaceDir;
+    for (;;) {
+      hierarchy.push({
+        directory: hierarchyDirectory,
+        allowPermissionBoundary:
+          hierarchyDirectory !== this.namespaceDir && hierarchyDirectory !== dataDir,
+      });
+      if (hierarchyDirectory === outermostTarget) break;
+      const parent = dirname(hierarchyDirectory);
+      if (parent === hierarchyDirectory) {
+        throw new Error('WAL created hierarchy escaped its configured data directory');
+      }
+      hierarchyDirectory = parent;
+    }
+    for (const entry of hierarchy) {
+      if (
+        retried.some(
+          (pending) =>
+            pending.directory === entry.directory &&
+            pending.reason === 'initialize-hierarchy',
+        )
+      ) {
+        continue;
+      }
+      this.markDirectoryMutation(
+        'initialize-hierarchy',
+        entry.directory,
+        entry.allowPermissionBoundary,
+      );
+      await this.syncDirectory(
+        entry.directory,
+        'initialize-hierarchy',
+        entry.allowPermissionBoundary,
+      );
+    }
     if (ackExisted) {
       const ackText = await this.readTextFileSecure(this.ackPath);
       this.pendingAckCount = ackText
@@ -471,7 +574,7 @@ export class WALStorage {
     this.markDirectoryMutation('rotate');
     await rename(this.path, segPath);
     await this.createSecureFile(this.path);
-    await this.syncDirectory('rotate');
+    await this.syncDirectory(this.dir, 'rotate');
   }
 
   private async listSegmentPathsUnlocked(): Promise<string[]> {
@@ -515,7 +618,7 @@ export class WALStorage {
           await this.assertSecureFile(p);
           this.markDirectoryMutation('delete-segment');
           await unlink(p);
-          await this.syncDirectory('delete-segment');
+          await this.syncDirectory(this.dir, 'delete-segment');
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
         }
@@ -541,7 +644,7 @@ export class WALStorage {
         await this.assertSecureFile(p);
         this.markDirectoryMutation('delete-segment');
         await unlink(p);
-        await this.syncDirectory('delete-segment');
+        await this.syncDirectory(this.dir, 'delete-segment');
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       }
@@ -737,7 +840,7 @@ export class WALStorage {
       await this.assertSecureFile(path);
       this.markDirectoryMutation('rewrite');
       await rename(tempPath, path);
-      await this.syncDirectory('rewrite');
+      await this.syncDirectory(this.dir, 'rewrite');
       tempPath = null;
     } finally {
       if (tempPath) await unlink(tempPath).catch(() => undefined);

@@ -1,4 +1,4 @@
-import { copyFile, mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
+import { copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,7 +23,9 @@ try {
     'package/dist/index.js',
     'package/dist/index.cjs',
     'package/dist/index.d.ts',
+    'package/dist/index.d.cts',
     'package/dist/durability/filesystem/index.js',
+    'package/dist/durability/filesystem/index.d.cts',
     'package/dist/durability/cloudflare/index.js',
   ]) {
     if (!listing.includes(required)) throw new Error(`packed artifact missing ${required}`);
@@ -34,13 +36,75 @@ try {
   await copyFile(join(root, 'scripts', 'packed-node-smoke.mjs'), join(consumer, 'packed-node-smoke.mjs'));
   const packageJson = JSON.parse(await readFile(join(consumer, 'node_modules', 'logbun', 'package.json'), 'utf8'));
   if (packageJson.version !== '1.0.0') throw new Error('packed package version mismatch');
+  await writeFile(
+    join(consumer, 'consumer.mts'),
+    [
+      "import { AuditLogger, MemoryReliabilityAdapter } from 'logbun';",
+      "import { FileReliabilityAdapter } from 'logbun/durability/filesystem';",
+      "import * as BunSqlite from 'logbun/adapters/bun-sqlite';",
+      "import * as Turso from 'logbun/adapters/turso';",
+      "import * as ClickHouse from 'logbun/adapters/clickhouse';",
+      "import * as Elysia from 'logbun/plugins/elysia';",
+      "import * as Hono from 'logbun/plugins/hono';",
+      "import * as Cloudflare from 'logbun/durability/cloudflare';",
+      'void AuditLogger;',
+      'void MemoryReliabilityAdapter;',
+      'void FileReliabilityAdapter;',
+      'void BunSqlite;',
+      'void Turso;',
+      'void ClickHouse;',
+      'void Elysia;',
+      'void Hono;',
+      'void Cloudflare;',
+      '',
+    ].join('\n'),
+  );
+  await writeFile(
+    join(consumer, 'consumer.cts'),
+    [
+      "import Logbun = require('logbun');",
+      "import Filesystem = require('logbun/durability/filesystem');",
+      "import BunSqlite = require('logbun/adapters/bun-sqlite');",
+      "import Turso = require('logbun/adapters/turso');",
+      "import ClickHouse = require('logbun/adapters/clickhouse');",
+      "import Elysia = require('logbun/plugins/elysia');",
+      "import Hono = require('logbun/plugins/hono');",
+      'void Logbun.AuditLogger;',
+      'void Logbun.MemoryReliabilityAdapter;',
+      'void Filesystem.FileReliabilityAdapter;',
+      'void BunSqlite;',
+      'void Turso;',
+      'void ClickHouse;',
+      'void Elysia;',
+      'void Hono;',
+      '',
+    ].join('\n'),
+  );
+  const tsc = join(root, 'node_modules', '.bin', 'tsc');
+  run(
+    tsc,
+    [
+      '--noEmit',
+      '--strict',
+      '--skipLibCheck',
+      '--target',
+      'ES2022',
+      '--module',
+      'NodeNext',
+      '--moduleResolution',
+      'NodeNext',
+      'consumer.mts',
+      'consumer.cts',
+    ],
+    consumer,
+  );
   const esm = run('node', ['--input-type=module', '-e', "import('logbun').then(({AuditLogger,MemoryReliabilityAdapter})=>{if(!AuditLogger||!MemoryReliabilityAdapter)throw new Error('missing root exports')})"], consumer);
   const cjs = run('node', ['-e', "const fs=require('node:fs');const os=require('node:os');const path=require('node:path');const p=require('logbun');const {FileReliabilityAdapter}=require('logbun/durability/filesystem');if(!p.AuditLogger||!FileReliabilityAdapter)throw new Error('missing CJS exports');(async()=>{const dir=fs.mkdtempSync(path.join(os.tmpdir(),'logbun-cjs-'));try{const r=new FileReliabilityAdapter({namespace:'cjs',dataDir:dir,instanceLock:false});await r.init();await r.appendJournal({id:'018f0000-0000-7000-8000-000000000003',actorId:'cjs',action:'cjs.smoke',createdAt:new Date().toISOString()});if((await r.recoverJournal()).logs.length!==1)throw new Error('CJS filesystem recovery failed');await r.close();}finally{fs.rmSync(dir,{recursive:true,force:true})}})().catch(e=>{console.error(e);process.exit(1)})"], consumer);
   const nodeSmoke = run('node', ['packed-node-smoke.mjs'], consumer);
   void esm;
   void cjs;
   process.stdout.write(nodeSmoke);
-  console.log('npm pack validation OK (exports, ESM, CJS, declarations)');
+  console.log('npm pack validation OK (exports, ESM, CJS, NodeNext declarations)');
 } finally {
   await rm(temp, { recursive: true, force: true });
 }

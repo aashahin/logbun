@@ -177,16 +177,20 @@ test('init heals a crash after requeue link without creating duplicate delivery'
 
   failAfterRequeueLink = true;
   await expect(dlq.requeueDead(id)).rejects.toThrow(/simulated crash/);
-  expect(await dlq.listPending()).toEqual([id]);
-  expect(await dlq.listDead()).toEqual([id]);
   const deadPath = join(dlq.directory, `${id}.batch.dead`);
   const pendingPath = join(dlq.directory, `${id}.batch`);
+  const crashEntries = await readdir(dlq.directory);
+  expect(crashEntries).toContain(`${id}.batch`);
+  expect(crashEntries).toContain(`${id}.batch.dead`);
   const [deadInfo, pendingInfo] = await Promise.all([lstat(deadPath), lstat(pendingPath)]);
   expect({ dev: deadInfo.dev, ino: deadInfo.ino }).toEqual({
     dev: pendingInfo.dev,
     ino: pendingInfo.ino,
   });
   expect((await dlq.readBatchFile(deadPath)).attempts).toBe(0);
+  expect(await dlq.listPending()).toEqual([id]);
+  expect(await dlq.listDead()).toEqual([]);
+  await expect(lstat(deadPath)).rejects.toThrow();
 
   const recovered = new DLQStorage('dlq-requeue-atomic', dataDir, { fsync: true });
   await recovered.init();
@@ -195,6 +199,79 @@ test('init heals a crash after requeue link without creating duplicate delivery'
   expect((await recovered.readBatchFile(pendingPath)).attempts).toBe(0);
   expect(await recovered.claim(id)).not.toBeNull();
   expect(await recovered.claim(id)).toBeNull();
+});
+
+test('post-link directory sync failure blocks delivery until repair durability succeeds', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-requeue-sync-debt-'));
+  cleanupPaths.push(dataDir);
+  let failDirectorySync = false;
+  const dlq = new DLQStorage('dlq-requeue-sync-debt', dataDir, {
+    fsync: true,
+    beforeRequeueLink: () => {
+      failDirectorySync = true;
+    },
+    directorySync: async () => {
+      if (!failDirectorySync) return;
+      const error = new Error('simulated post-link directory sync failure') as NodeJS.ErrnoException;
+      error.code = 'EIO';
+      throw error;
+    },
+  });
+  await dlq.init();
+  const id = await dlq.write('tenant-a', [makeLog('sync-debt', 'tenant-a')]);
+  await dlq.claim(id);
+  await dlq.setAttempts(id, 3);
+  await dlq.markPoisoned(id);
+
+  await expect(dlq.requeueDead(id)).rejects.toThrow(/post-link directory sync failure/);
+  const entries = await readdir(dlq.directory);
+  expect(entries).toContain(`${id}.batch`);
+  expect(entries).toContain(`${id}.batch.dead`);
+
+  await expect(dlq.recoverOrphans()).rejects.toThrow(/post-link directory sync failure/);
+  await expect(dlq.listPending()).rejects.toThrow(/post-link directory sync failure/);
+  await expect(dlq.claim(id)).rejects.toThrow(/post-link directory sync failure/);
+  await expect(dlq.requeueDead(id)).rejects.toThrow(/post-link directory sync failure/);
+
+  failDirectorySync = false;
+  await expect(dlq.recoverOrphans()).resolves.toBeUndefined();
+  expect(await dlq.listPending()).toEqual([id]);
+  expect(await dlq.listDead()).toEqual([]);
+  expect(await dlq.claim(id)).not.toBeNull();
+  expect(await dlq.claim(id)).toBeNull();
+  await expect(dlq.requeueDead(id)).rejects.toThrow(/expects a dead DLQ entry id/);
+});
+
+test('delivery listing fails closed while a linked requeue transition is still running', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-requeue-in-flight-'));
+  cleanupPaths.push(dataDir);
+  let signalLinked!: () => void;
+  const linked = new Promise<void>((resolve) => {
+    signalLinked = resolve;
+  });
+  let finishRequeue!: () => void;
+  const mayFinish = new Promise<void>((resolve) => {
+    finishRequeue = resolve;
+  });
+  const dlq = new DLQStorage('dlq-requeue-in-flight', dataDir, {
+    fsync: true,
+    afterRequeueLink: async () => {
+      signalLinked();
+      await mayFinish;
+    },
+  });
+  await dlq.init();
+  const id = await dlq.write('tenant-a', [makeLog('in-flight', 'tenant-a')]);
+  await dlq.claim(id);
+  await dlq.markPoisoned(id);
+
+  const requeue = dlq.requeueDead(id);
+  await linked;
+  await expect(dlq.listPending()).rejects.toThrow(/requeue transition is in progress/);
+  finishRequeue();
+  await expect(requeue).resolves.toBe(id);
+  expect(await dlq.listPending()).toEqual([id]);
+  expect(await dlq.listDead()).toEqual([]);
 });
 
 test('init fails closed for duplicate pending and dead states with different inodes', async () => {

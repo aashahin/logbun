@@ -13,50 +13,87 @@
   },
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs",
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      },
       "default": "./dist/index.js"
     },
     "./durability/filesystem": {
-      "types": "./dist/durability/filesystem/index.d.ts",
-      "import": "./dist/durability/filesystem/index.js",
-      "require": "./dist/durability/filesystem/index.cjs",
+      "import": {
+        "types": "./dist/durability/filesystem/index.d.ts",
+        "default": "./dist/durability/filesystem/index.js"
+      },
+      "require": {
+        "types": "./dist/durability/filesystem/index.d.cts",
+        "default": "./dist/durability/filesystem/index.cjs"
+      },
       "default": "./dist/durability/filesystem/index.js"
     },
     "./durability/cloudflare": {
-      "types": "./dist/durability/cloudflare/index.d.ts",
-      "import": "./dist/durability/cloudflare/index.js",
+      "import": {
+        "types": "./dist/durability/cloudflare/index.d.ts",
+        "default": "./dist/durability/cloudflare/index.js"
+      },
       "default": "./dist/durability/cloudflare/index.js"
     },
     "./adapters/bun-sqlite": {
-      "types": "./dist/adapters/bun-sqlite.d.ts",
-      "import": "./dist/adapters/bun-sqlite.js",
-      "require": "./dist/adapters/bun-sqlite.cjs",
+      "import": {
+        "types": "./dist/adapters/bun-sqlite.d.ts",
+        "default": "./dist/adapters/bun-sqlite.js"
+      },
+      "require": {
+        "types": "./dist/adapters/bun-sqlite.d.cts",
+        "default": "./dist/adapters/bun-sqlite.cjs"
+      },
       "default": "./dist/adapters/bun-sqlite.js"
     },
     "./adapters/turso": {
-      "types": "./dist/adapters/turso.d.ts",
-      "import": "./dist/adapters/turso.js",
-      "require": "./dist/adapters/turso.cjs",
+      "import": {
+        "types": "./dist/adapters/turso.d.ts",
+        "default": "./dist/adapters/turso.js"
+      },
+      "require": {
+        "types": "./dist/adapters/turso.d.cts",
+        "default": "./dist/adapters/turso.cjs"
+      },
       "default": "./dist/adapters/turso.js"
     },
     "./adapters/clickhouse": {
-      "types": "./dist/adapters/clickhouse.d.ts",
-      "import": "./dist/adapters/clickhouse.js",
-      "require": "./dist/adapters/clickhouse.cjs",
+      "import": {
+        "types": "./dist/adapters/clickhouse.d.ts",
+        "default": "./dist/adapters/clickhouse.js"
+      },
+      "require": {
+        "types": "./dist/adapters/clickhouse.d.cts",
+        "default": "./dist/adapters/clickhouse.cjs"
+      },
       "default": "./dist/adapters/clickhouse.js"
     },
     "./plugins/elysia": {
-      "types": "./dist/plugins/elysia.d.ts",
-      "import": "./dist/plugins/elysia.js",
-      "require": "./dist/plugins/elysia.cjs",
+      "import": {
+        "types": "./dist/plugins/elysia.d.ts",
+        "default": "./dist/plugins/elysia.js"
+      },
+      "require": {
+        "types": "./dist/plugins/elysia.d.cts",
+        "default": "./dist/plugins/elysia.cjs"
+      },
       "default": "./dist/plugins/elysia.js"
     },
     "./plugins/hono": {
-      "types": "./dist/plugins/hono.d.ts",
-      "import": "./dist/plugins/hono.js",
-      "require": "./dist/plugins/hono.cjs",
+      "import": {
+        "types": "./dist/plugins/hono.d.ts",
+        "default": "./dist/plugins/hono.js"
+      },
+      "require": {
+        "types": "./dist/plugins/hono.d.cts",
+        "default": "./dist/plugins/hono.cjs"
+      },
       "default": "./dist/plugins/hono.js"
     }
   },

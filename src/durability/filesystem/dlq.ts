@@ -66,6 +66,8 @@ export interface DLQStorageOptions {
   ) => void | Promise<void>;
   /** @internal Deterministic hard-link seam for unsupported-platform tests. */
   requeueLink?: (deadPath: string, pendingPath: string) => Promise<void>;
+  /** @internal Deterministic directory-fsync seam for fault/order tests. */
+  directorySync?: (directory: string) => void | Promise<void>;
 }
 
 export const DLQ_MAX_FILES_DEFAULT = 10_000;
@@ -183,6 +185,9 @@ export class DLQStorage {
   private readonly beforeRequeueLink?: DLQStorageOptions['beforeRequeueLink'];
   private readonly afterRequeueLink?: DLQStorageOptions['afterRequeueLink'];
   private readonly requeueLink: NonNullable<DLQStorageOptions['requeueLink']>;
+  private readonly directorySync?: DLQStorageOptions['directorySync'];
+  private requeueRepairPending = false;
+  private requeueTransitionInFlight = false;
   private writeChain: Promise<void> = Promise.resolve();
 
   constructor(
@@ -202,6 +207,7 @@ export class DLQStorage {
     this.beforeRequeueLink = options?.beforeRequeueLink;
     this.afterRequeueLink = options?.afterRequeueLink;
     this.requeueLink = options?.requeueLink ?? ((deadPath, pendingPath) => link(deadPath, pendingPath));
+    this.directorySync = options?.directorySync;
   }
 
   private runWriteExclusive<T>(fn: () => Promise<T>): Promise<T> {
@@ -226,7 +232,7 @@ export class DLQStorage {
     await this.assertStorageSegments(true);
     await mkdir(this.dir, { recursive: true });
     await this.assertSecureDirectory();
-    await this.healRequeueLinkDuplicates();
+    await this.settleRequeueState(true);
   }
 
   async countByKind(): Promise<{
@@ -235,6 +241,7 @@ export class DLQStorage {
     dead: number;
     total: number;
   }> {
+    await this.settleRequeueState();
     await this.assertSecureDirectory();
     let entries: string[];
     try {
@@ -422,11 +429,15 @@ export class DLQStorage {
 
   private async fsyncDirectory(): Promise<void> {
     try {
-      const fh = await open(this.dir, 'r');
-      try {
-        await fh.sync();
-      } finally {
-        await fh.close();
+      if (this.directorySync) {
+        await this.directorySync(this.dir);
+      } else {
+        const fh = await open(this.dir, 'r');
+        try {
+          await fh.sync();
+        } finally {
+          await fh.close();
+        }
       }
     } catch (error) {
       // Directory fsync is unavailable on a few supported filesystem/runtime
@@ -481,6 +492,7 @@ export class DLQStorage {
       }
       throw error;
     }
+    this.requeueRepairPending = true;
     if (this.fsync) await this.fsyncDirectory();
   }
 
@@ -507,9 +519,20 @@ export class DLQStorage {
           `dlq_state_collision: pending and dead states for ${id} are different files`,
         );
       }
+      this.requeueRepairPending = true;
       await unlink(deadPath);
       if (this.fsync) await this.fsyncDirectory();
     }
+  }
+
+  private async settleRequeueState(forceScan = false): Promise<void> {
+    if (this.requeueTransitionInFlight) {
+      throw new Error('dlq_requeue_in_progress: requeue transition is in progress');
+    }
+    if (!forceScan && !this.requeueRepairPending) return;
+    await this.healRequeueLinkDuplicates();
+    if (this.requeueRepairPending && this.fsync) await this.fsyncDirectory();
+    this.requeueRepairPending = false;
   }
 
   private async writeFileBody(path: string, body: string): Promise<void> {
@@ -569,6 +592,7 @@ export class DLQStorage {
 
   /** Resolve opaque id → absolute path for any state, or null. */
   async resolvePath(id: string): Promise<{ path: string; state: DlqState } | null> {
+    await this.settleRequeueState();
     if (typeof id !== 'string' || !OPAQUE_ID_RE.test(id)) {
       return null;
     }
@@ -716,6 +740,7 @@ export class DLQStorage {
    */
   async requeueDead(id: string): Promise<string> {
     return this.runWriteExclusive(async () => {
+      await this.settleRequeueState();
       if (typeof id !== 'string' || !OPAQUE_ID_RE.test(id)) {
         throw new Error('requeueDead expects a dead DLQ entry id');
       }
@@ -748,11 +773,17 @@ export class DLQStorage {
       if (batch.v !== 2 || batch.id !== stableId || batch.attempts !== 0) {
         await this.writeFileBody(deadPath, JSON.stringify(envelope));
       }
-      await this.beforeRequeueLink?.(deadPath, newPath);
-      await this.linkRequeueState(deadPath, newPath);
-      await this.afterRequeueLink?.(deadPath, newPath);
-      await this.unlinkSecurely(deadPath);
-      return stableId;
+      this.requeueTransitionInFlight = true;
+      try {
+        await this.beforeRequeueLink?.(deadPath, newPath);
+        await this.linkRequeueState(deadPath, newPath);
+        await this.afterRequeueLink?.(deadPath, newPath);
+        await this.unlinkSecurely(deadPath);
+        this.requeueRepairPending = false;
+        return stableId;
+      } finally {
+        this.requeueTransitionInFlight = false;
+      }
     });
   }
 
@@ -775,6 +806,7 @@ export class DLQStorage {
   }
 
   private async listPathsBySuffix(suffix: string): Promise<string[]> {
+    await this.settleRequeueState();
     await this.assertSecureDirectory();
     let entries: string[];
     try {
@@ -830,6 +862,7 @@ export class DLQStorage {
 
   /** @deprecated Prefer claim(id). Path-based mark for internal tests. */
   async markProcessing(filePath: string): Promise<string> {
+    await this.settleRequeueState();
     this.assertUnderDir(filePath);
     const id = idFromFilename(filePath);
     if (!id) throw new Error('invalid DLQ path');
@@ -930,7 +963,7 @@ export class DLQStorage {
 
   async recoverOrphans(): Promise<void> {
     await this.assertSecureDirectory();
-    await this.healRequeueLinkDuplicates();
+    await this.settleRequeueState(true);
     let entries: string[];
     try {
       entries = await readdir(this.dir);
