@@ -250,7 +250,7 @@ export class Batcher {
       return false;
     }
 
-    const queue = this.getOrCreateQueue(key);
+    let queue = this.getOrCreateQueue(key);
 
     if (!(await this.admitUnderBackpressure(key, queue, tenantId))) {
       this.maybePruneQueue(key);
@@ -262,6 +262,10 @@ export class Batcher {
       return false;
     }
 
+    // Either pre-admission spill may prune an emptied queue key. Reacquire the
+    // live queue before reserving/pushing so the current log cannot enter a
+    // detached array that is no longer tracked by the batcher.
+    queue = this.getOrCreateQueue(key);
     this.reserve(key);
     try {
       const durable = await this.appendDurable(log, tenantId);
@@ -768,12 +772,46 @@ export class Batcher {
       return false;
     }
 
-    if (!(await this.dumpQueueToDlq(key, queue, tenantId))) return false;
+    if (
+      !(await this.dumpPriorQueueToDlq(
+        key,
+        queue,
+        tenantId,
+        'pre_admission_backpressure',
+      ))
+    ) {
+      return false;
+    }
 
     if (this.occupancy(key, queue) >= this.config.maxQueueSize) {
-      return this.dumpQueueToDlq(key, queue, tenantId);
+      return this.dumpPriorQueueToDlq(
+        key,
+        queue,
+        tenantId,
+        'pre_admission_backpressure',
+      );
     }
     return true;
+  }
+
+  /**
+   * A pre-admission spill only mutates logs that were already queued. Preserve
+   * its committed scheduling failure under the spilled tenant as prior-work
+   * debt, then treat the durable spill itself as successful for current admission.
+   */
+  private async dumpPriorQueueToDlq(
+    key: string,
+    queue: LogbunLog[],
+    tenantId: string | null,
+    detail: string,
+  ): Promise<boolean> {
+    try {
+      return await this.dumpQueueToDlq(key, queue, tenantId);
+    } catch (error) {
+      if (!isDurableAdmissionSchedulingError(error)) throw error;
+      this.retainCommittedSchedulingError(error, tenantId, detail);
+      return true;
+    }
   }
 
   /**
@@ -821,7 +859,14 @@ export class Batcher {
         return false;
       }
       const victimTenant = victimKey === '__global__' ? null : victimKey;
-      if (!(await this.dumpQueueToDlq(victimKey, victimQueue, victimTenant))) {
+      if (
+        !(await this.dumpPriorQueueToDlq(
+          victimKey,
+          victimQueue,
+          victimTenant,
+          'pre_admission_global_cap',
+        ))
+      ) {
         this.emit({
           type: 'drop',
           tenantId,
@@ -837,7 +882,14 @@ export class Batcher {
       // Last resort: dump current key if it already has data
       const queue = this.queues.get(key);
       if (queue && queue.length > 0) {
-        if (!(await this.dumpQueueToDlq(key, queue, tenantId))) {
+        if (
+          !(await this.dumpPriorQueueToDlq(
+            key,
+            queue,
+            tenantId,
+            'pre_admission_global_cap',
+          ))
+        ) {
           this.emit({
             type: 'drop',
             tenantId,
@@ -1027,17 +1079,36 @@ export class Batcher {
   private flushInBackground(key: string): void {
     void this.flush(key).catch((error) => {
       const committed = isDurableAdmissionSchedulingError(error);
-      if (committed && this.pendingCommittedSchedulingError === undefined) {
-        this.pendingCommittedSchedulingError = error;
+      if (committed) {
+        this.retainCommittedSchedulingError(
+          error,
+          key === '__global__' ? null : key,
+          'background_committed_scheduling',
+        );
+        return;
       }
       this.emit({
         type: 'flush_fail',
         tenantId: key === '__global__' ? null : key,
-        detail: committed
-          ? 'background_committed_scheduling'
-          : 'background_flush',
+        detail: 'background_flush',
         error: error instanceof Error ? error.message : String(error),
       });
+    });
+  }
+
+  private retainCommittedSchedulingError(
+    error: unknown,
+    tenantId: string | null,
+    detail: string,
+  ): void {
+    if (this.pendingCommittedSchedulingError === undefined) {
+      this.pendingCommittedSchedulingError = error;
+    }
+    this.emit({
+      type: 'flush_fail',
+      tenantId,
+      detail,
+      error: error instanceof Error ? error.message : String(error),
     });
   }
 

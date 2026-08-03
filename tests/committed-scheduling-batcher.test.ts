@@ -3,9 +3,13 @@ import { expect, test } from 'bun:test';
 import { Batcher } from '../src/engine/batcher';
 import { ConnectionPool } from '../src/engine/pool';
 import { RetryEngine } from '../src/engine/retry';
+import { AuditLogger } from '../src/logger';
 import { MemoryReliabilityAdapter } from '../src/reliability/memory';
-import { DurableAdmissionSchedulingError } from '../src/reliability/scheduling-error';
-import type { LogbunLog, ReliabilityAdapter } from '../src/types';
+import {
+  DurableAdmissionSchedulingError,
+  isDurableAdmissionSchedulingError,
+} from '../src/reliability/scheduling-error';
+import type { LogbunEvent, LogbunLog, ReliabilityAdapter } from '../src/types';
 import { memoryAdapter } from './helpers';
 
 type MutationKind = 'appendJournal' | 'writeDlq';
@@ -23,17 +27,24 @@ function log(id: string, tenantId?: string): LogbunLog {
 function faultingReliability(): {
   reliability: ReliabilityAdapter;
   arm: (kind: MutationKind, error: unknown) => void;
-  failAppendBeforeCommit: (error: unknown) => void;
-  failDlqBeforeCommit: (error: unknown) => void;
+  failAppendBeforeCommit: (error: unknown, action?: string) => void;
+  failDlqBeforeCommit: (error: unknown, action?: string) => void;
+  appendAttempts: () => readonly LogbunLog[];
   holdAppend: (id: string) => {
     reached: Promise<void>;
     release: () => void;
   };
 } {
   const memory = new MemoryReliabilityAdapter({ enableJournal: true });
-  let armed: { kind: MutationKind; error: unknown } | null = null;
-  let appendBeforeCommitError: unknown;
-  let dlqBeforeCommitError: unknown;
+  const armed: Record<MutationKind, unknown[]> = {
+    appendJournal: [],
+    writeDlq: [],
+  };
+  const attemptedAppends: LogbunLog[] = [];
+  let appendBeforeCommitFailure:
+    | { error: unknown; action?: string }
+    | undefined;
+  let dlqBeforeCommitFailure: { error: unknown; action?: string } | undefined;
   let appendHold: {
     id: string;
     reached: () => void;
@@ -46,9 +57,14 @@ function faultingReliability(): {
       if (property === 'persistent') return true;
       if (property === 'appendJournal') {
         return async (entry: LogbunLog) => {
-          if (appendBeforeCommitError !== undefined) {
-            const error = appendBeforeCommitError;
-            appendBeforeCommitError = undefined;
+          attemptedAppends.push(entry);
+          if (
+            appendBeforeCommitFailure !== undefined &&
+            (appendBeforeCommitFailure.action === undefined ||
+              appendBeforeCommitFailure.action === entry.action)
+          ) {
+            const { error } = appendBeforeCommitFailure;
+            appendBeforeCommitFailure = undefined;
             throw error;
           }
           await appendJournal(entry);
@@ -58,24 +74,28 @@ function faultingReliability(): {
             hold.reached();
             await hold.wait;
           }
-          if (armed?.kind === 'appendJournal') {
-            const error = armed.error;
-            armed = null;
+          if (armed.appendJournal.length > 0) {
+            const error = armed.appendJournal.shift();
             throw error;
           }
         };
       }
       if (property === 'writeDlq') {
         return async (tenantId: string | null, entries: LogbunLog[]) => {
-          if (dlqBeforeCommitError !== undefined) {
-            const error = dlqBeforeCommitError;
-            dlqBeforeCommitError = undefined;
+          if (
+            dlqBeforeCommitFailure !== undefined &&
+            (dlqBeforeCommitFailure.action === undefined ||
+              entries.some(
+                (entry) => entry.action === dlqBeforeCommitFailure?.action,
+              ))
+          ) {
+            const { error } = dlqBeforeCommitFailure;
+            dlqBeforeCommitFailure = undefined;
             throw error;
           }
           const id = await writeDlq(tenantId, entries);
-          if (armed?.kind === 'writeDlq') {
-            const error = armed.error;
-            armed = null;
+          if (armed.writeDlq.length > 0) {
+            const error = armed.writeDlq.shift();
             throw error;
           }
           return id;
@@ -88,14 +108,15 @@ function faultingReliability(): {
   return {
     reliability,
     arm: (kind, error) => {
-      armed = { kind, error };
+      armed[kind].push(error);
     },
-    failAppendBeforeCommit: (error) => {
-      appendBeforeCommitError = error;
+    failAppendBeforeCommit: (error, action) => {
+      appendBeforeCommitFailure = { error, action };
     },
-    failDlqBeforeCommit: (error) => {
-      dlqBeforeCommitError = error;
+    failDlqBeforeCommit: (error, action) => {
+      dlqBeforeCommitFailure = { error, action };
     },
+    appendAttempts: () => attemptedAppends,
     holdAppend: (id) => {
       let reachedResolve!: () => void;
       const reached = new Promise<void>((resolve) => {
@@ -345,49 +366,6 @@ const committedSchedulingCases = [
   },
 
   {
-    name: 'backpressure dump does not restore its committed DLQ batch to RAM or WAL',
-    run: async () => {
-      const { reliability, arm } = faultingReliability();
-      await reliability.init();
-      const destination = memoryAdapter();
-      const batcher = batcherFor(
-        reliability,
-        destination,
-        new ConnectionPool(destination, 5),
-        1,
-      );
-      await batcher.enqueue(log('backpressure-committed'));
-      const committedError = new DurableAdmissionSchedulingError(
-        new Error('backpressure alarm EIO'),
-      );
-      arm('writeDlq', committedError);
-
-      const observed = await batcher.enqueue(log('not-yet-admitted')).then(
-        () => null,
-        (error: unknown) => error,
-      );
-      expect(observed).toBe(committedError);
-      expect((await reliability.recoverJournal()).logs).toEqual([]);
-      expect(await reliability.listDlq()).toEqual([
-        expect.objectContaining({ state: 'pending', logCount: 1 }),
-      ]);
-      expect(batcher.getStats().queued).toBe(0);
-
-      const retry = new RetryEngine({
-        reliability,
-        adapter: destination,
-        pool: new ConnectionPool(destination, 5),
-        retry: { insertMaxRetries: 1, insertBaseDelayMs: 0 },
-      });
-      await retry.scan();
-      expect(destination.inserted.map((entry) => entry.id)).toEqual([
-        'backpressure-committed',
-      ]);
-      expect(await reliability.listDlq()).toEqual([]);
-    },
-  },
-
-  {
     name: 'queue-room fallback keeps the target only in DLQ while preserving unrelated RAM work',
     run: async () => {
       const { reliability, arm, failDlqBeforeCommit, holdAppend } =
@@ -449,6 +427,189 @@ test.each(committedSchedulingCases)(
   'committed scheduling error: $name',
   async ({ run }) => {
     await run();
+  },
+);
+
+const preAdmissionAttributionCases = (
+  [
+    {
+      pressure: 'backpressure',
+      oldTenant: 'tenant-a',
+      currentTenant: 'tenant-a',
+      maxQueueSize: 1,
+      maxTotalQueued: 100,
+    },
+    {
+      pressure: 'global-cap',
+      oldTenant: 'old-tenant',
+      currentTenant: 'current-tenant',
+      maxQueueSize: 100,
+      maxTotalQueued: 1,
+    },
+  ] as const
+).flatMap((pressureCase) =>
+  (
+    ['succeeds', 'fails-precommit', 'commits-then-scheduling-fails'] as const
+  ).map((outcome) => ({ ...pressureCase, outcome })),
+);
+
+test.each(preAdmissionAttributionCases)(
+  'pre-admission $pressure spill debt keeps $outcome attribution on the current event',
+  async ({
+    pressure,
+    outcome,
+    oldTenant,
+    currentTenant,
+    maxQueueSize,
+    maxTotalQueued,
+  }) => {
+    const {
+      reliability,
+      arm,
+      failAppendBeforeCommit,
+      failDlqBeforeCommit,
+      appendAttempts,
+    } = faultingReliability();
+    let rearmCalls = 0;
+    Object.assign(reliability, {
+      async requestMaintenance() {
+        rearmCalls++;
+      },
+    });
+    const destination = memoryAdapter();
+    const events: LogbunEvent[] = [];
+    const audit = new AuditLogger({
+      namespace: `attribution-${pressure}-${outcome}`,
+      mode: 'durable',
+      reliability,
+      adapter: destination,
+      batching: {
+        maxSize: 10,
+        flushInterval: 60_000,
+        maxQueueSize,
+        onQueueFull: 'dlq',
+      },
+      maxTotalQueued,
+      retry: { insertMaxRetries: 1, insertBaseDelayMs: 0 },
+      onEvent: (event) => events.push(event),
+    });
+    await audit.ready;
+    const oldAction = `older.${pressure}.${outcome}`;
+    const currentAction = `current.${pressure}.${outcome}`;
+    await audit.fireAsync(oldAction, {
+      actorId: 'older',
+      tenantId: oldTenant,
+    });
+    const oldId = appendAttempts().at(-1)!.id;
+    const priorError = new DurableAdmissionSchedulingError(
+      new Error(`older ${pressure} alarm EIO`),
+    );
+    const currentCommittedError = new DurableAdmissionSchedulingError(
+      new Error(`current ${pressure} alarm EIO`),
+    );
+    arm('writeDlq', priorError);
+    if (outcome === 'fails-precommit') {
+      failAppendBeforeCommit(
+        new Error('current WAL failed before commit'),
+        currentAction,
+      );
+      failDlqBeforeCommit(
+        new Error('current DLQ fallback failed before commit'),
+        currentAction,
+      );
+    } else if (outcome === 'commits-then-scheduling-fails') {
+      arm('appendJournal', currentCommittedError);
+    }
+
+    const observedAdmission = await audit
+      .fireAsync(currentAction, {
+        actorId: 'current',
+        tenantId: currentTenant,
+      })
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+    const firstCurrentId = appendAttempts().at(-1)!.id;
+    const shouldRetryCurrent =
+      observedAdmission !== null &&
+      !isDurableAdmissionSchedulingError(observedAdmission);
+    expect(shouldRetryCurrent).toBe(outcome === 'fails-precommit');
+    if (outcome === 'succeeds') {
+      expect(observedAdmission).toBeNull();
+    } else if (outcome === 'fails-precommit') {
+      expect(observedAdmission).toBeInstanceOf(Error);
+      expect(observedAdmission).not.toBe(priorError);
+      expect(isDurableAdmissionSchedulingError(observedAdmission)).toBe(false);
+    } else {
+      expect(observedAdmission).toBe(currentCommittedError);
+    }
+
+    const journalBeforeMaintenance = (await reliability.recoverJournal()).logs;
+    expect(journalBeforeMaintenance.map((entry) => entry.id)).toEqual(
+      outcome === 'fails-precommit' ? [] : [firstCurrentId],
+    );
+    const dlqBeforeMaintenance = await reliability.listDlq();
+    expect(dlqBeforeMaintenance).toEqual([
+      expect.objectContaining({
+        state: 'pending',
+        tenantId: oldTenant,
+        logCount: 1,
+      }),
+    ]);
+    const oldBatch = await reliability.readDlq(dlqBeforeMaintenance[0]!.id);
+    expect(oldBatch?.logs.map((entry) => entry.id)).toEqual([oldId]);
+    expect(oldBatch?.logs.map((entry) => entry.action)).toEqual([oldAction]);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'flush_fail',
+        tenantId: oldTenant,
+        detail: `pre_admission_${pressure.replace('-', '_')}`,
+      }),
+    );
+    expect(audit.getStats().queued).toBe(outcome === 'succeeds' ? 1 : 0);
+
+    const observedMaintenance = await audit.runMaintenance().then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(observedMaintenance).toBe(priorError);
+    expect(rearmCalls).toBe(1);
+    expect(destination.inserted.map((entry) => entry.id)).toEqual([oldId]);
+
+    let deliverableCurrentId = firstCurrentId;
+    if (outcome === 'fails-precommit') {
+      await expect(
+        audit.fireAsync(currentAction, {
+          actorId: 'current-retry',
+          tenantId: currentTenant,
+        }),
+      ).resolves.toBeUndefined();
+      deliverableCurrentId = appendAttempts().at(-1)!.id;
+      expect(deliverableCurrentId).not.toBe(firstCurrentId);
+    }
+
+    await expect(audit.runMaintenance()).resolves.toBeUndefined();
+    expect(rearmCalls).toBe(2);
+    if (outcome === 'commits-then-scheduling-fails') {
+      const recoveryBatcher = batcherFor(reliability, destination);
+      recoveryBatcher.injectRecovered(
+        (await reliability.recoverJournal()).logs as LogbunLog[],
+      );
+      await recoveryBatcher.flushAll();
+    }
+    expect(destination.inserted.map((entry) => entry.id).sort()).toEqual(
+      [oldId, deliverableCurrentId].sort(),
+    );
+    expect(new Set(destination.inserted.map((entry) => entry.id)).size).toBe(2);
+    if (outcome === 'fails-precommit') {
+      expect(destination.inserted.map((entry) => entry.id)).not.toContain(
+        firstCurrentId,
+      );
+    }
+    expect((await reliability.recoverJournal()).logs).toEqual([]);
+    expect(await reliability.listDlq()).toEqual([]);
+    await audit.shutdown();
   },
 );
 
