@@ -104,6 +104,42 @@ contractSuite('filesystem', async () => {
   return makeFileReliability('contract', dataDir, { maxDlqEntries: 100 });
 });
 
+function strictByteBoundSuite(
+  name: string,
+  create: () => Promise<ReliabilityAdapter>,
+) {
+  test(`${name}: journal recovery enforces strict and normalized byte bounds`, async () => {
+    const r = await create();
+    await r.init();
+    await r.appendJournal(log(`${name}-oversized`));
+
+    for (const maxBytes of [0, 1, -1]) {
+      const bounded = await r.recoverJournal({ maxBytes });
+      expect(bounded.logs).toEqual([]);
+      expect(bounded.truncated).toBe(true);
+    }
+
+    // Non-finite values are invalid and therefore treated as unbounded.
+    for (const maxBytes of [Number.NaN, Number.POSITIVE_INFINITY]) {
+      const unbounded = await r.recoverJournal({ maxBytes });
+      expect(unbounded.logs.map((item) => item.id)).toEqual([`${name}-oversized`]);
+      expect(unbounded.truncated).toBe(false);
+    }
+    await r.close();
+  });
+}
+
+strictByteBoundSuite(
+  'memory',
+  async () => new MemoryReliabilityAdapter({ enableJournal: true }),
+);
+
+strictByteBoundSuite('filesystem', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-contract-bytes-'));
+  cleanup.push(dataDir);
+  return makeFileReliability('contract-bytes', dataDir);
+});
+
 test('memory: dlq_full at max entries', async () => {
   const r = new MemoryReliabilityAdapter({ maxDlqEntries: 1 });
   await r.init();

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -155,4 +155,94 @@ test('failed retry metadata replacement leaves the processing batch valid', asyn
   expect(preserved.attempts).toBe(0);
   expect(preserved.logs.map((log) => log.id)).toEqual(['atomic-1']);
   expect((await readdir(dlq.directory)).some((name) => name.endsWith('.tmp'))).toBe(false);
+});
+
+test('failed requeue state rename leaves one valid reset dead entry and can retry', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-requeue-atomic-'));
+  cleanupPaths.push(dataDir);
+  let failRequeueRename = false;
+  const dlq = new DLQStorage('dlq-requeue-atomic', dataDir, {
+    fsync: true,
+    beforeAtomicRename: async (targetPath) => {
+      if (failRequeueRename && targetPath.endsWith('.batch')) {
+        throw new Error('simulated crash before requeue rename');
+      }
+    },
+  });
+  await dlq.init();
+  const id = await dlq.write('tenant-a', [makeLog('requeue-1', 'tenant-a')]);
+  await dlq.claim(id);
+  await dlq.setAttempts(id, 3);
+  await dlq.markPoisoned(id);
+
+  failRequeueRename = true;
+  await expect(dlq.requeueDead(id)).rejects.toThrow(/simulated crash/);
+  expect(await dlq.listPending()).toEqual([]);
+  expect(await dlq.listDead()).toEqual([id]);
+  const stillDead = await dlq.resolvePath(id);
+  expect(stillDead?.state).toBe('dead');
+  expect((await dlq.readBatchFile(stillDead!.path)).attempts).toBe(0);
+
+  failRequeueRename = false;
+  expect(await dlq.requeueDead(id)).toBe(id);
+  expect(await dlq.listDead()).toEqual([]);
+  expect(await dlq.listPending()).toEqual([id]);
+  const pending = await dlq.resolvePath(id);
+  expect((await dlq.readBatchFile(pending!.path)).attempts).toBe(0);
+});
+
+test('requeueDead rejects a duplicate pending state without overwriting either entry', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-requeue-collision-'));
+  cleanupPaths.push(dataDir);
+  const dlq = new DLQStorage('dlq-requeue-collision', dataDir);
+  await dlq.init();
+  const id = await dlq.write('dead-tenant', [makeLog('dead-log', 'dead-tenant')]);
+  await dlq.claim(id);
+  await dlq.markPoisoned(id);
+  const deadPath = join(dlq.directory, `${id}.batch.dead`);
+  const pendingPath = join(dlq.directory, `${id}.batch`);
+  const collision = JSON.stringify({
+    v: 2,
+    id,
+    tenantId: 'pending-tenant',
+    attempts: 0,
+    logs: [makeLog('pending-log', 'pending-tenant')],
+  });
+  await writeFile(pendingPath, collision);
+
+  await expect(dlq.requeueDead(id)).rejects.toThrow(/dlq_state_collision/);
+  expect((await readBatch(deadPath)).logs.map((item) => item.id)).toEqual(['dead-log']);
+  expect((await readBatch(pendingPath)).logs.map((item) => item.id)).toEqual(['pending-log']);
+});
+
+test('requeueDead rejects a pending collision introduced at the state-transition hook', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-requeue-race-'));
+  cleanupPaths.push(dataDir);
+  let injectCollision = false;
+  let collision = '';
+  const dlq = new DLQStorage('dlq-requeue-race', dataDir, {
+    beforeAtomicRename: async (targetPath) => {
+      if (injectCollision && targetPath.endsWith('.batch')) {
+        await writeFile(targetPath, collision, { flag: 'wx' });
+      }
+    },
+  });
+  await dlq.init();
+  const id = await dlq.write('dead-tenant', [makeLog('dead-log', 'dead-tenant')]);
+  await dlq.claim(id);
+  await dlq.markPoisoned(id);
+  const deadPath = join(dlq.directory, `${id}.batch.dead`);
+  const pendingPath = join(dlq.directory, `${id}.batch`);
+  collision = JSON.stringify({
+    v: 2,
+    id,
+    tenantId: 'racing-tenant',
+    attempts: 0,
+    logs: [makeLog('racing-log', 'racing-tenant')],
+  });
+
+  injectCollision = true;
+  await expect(dlq.requeueDead(id)).rejects.toThrow(/dlq_state_collision/);
+  expect((await readBatch(deadPath)).logs.map((item) => item.id)).toEqual(['dead-log']);
+  expect((await readBatch(pendingPath)).logs.map((item) => item.id)).toEqual(['racing-log']);
 });

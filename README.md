@@ -100,9 +100,11 @@ import { FileReliabilityAdapter } from 'logbun/durability/filesystem';
 
 // Supply your runtime's destination adapter (Postgres, HTTP collector, etc.).
 declare const destination: IAdapter;
+// Inject this from the runtime-specific entrypoint; keep it unique per replica.
+declare const instanceId: string;
 
 const reliability = new FileReliabilityAdapter({
-  namespace: process.env.INSTANCE_ID ?? 'my-app', // unique per replica
+  namespace: instanceId,
   dataDir: '.logbun',
   wal: { fsync: true },
   dlq: { fsync: true },
@@ -129,7 +131,26 @@ await audit.runMaintenance();
 await audit.shutdown();
 ```
 
-**Deno:** `deno run --allow-read --allow-write=./.logbun app.ts`
+Read the instance ID in the runtime-specific entrypoint, then pass it to the
+shared setup above:
+
+```typescript
+// Node.js
+const instanceId = process.env.INSTANCE_ID ?? 'my-app-instance-1';
+```
+
+```typescript
+// Bun
+const instanceId = Bun.env.INSTANCE_ID ?? 'my-app-instance-1';
+```
+
+```typescript
+// Deno (requires --allow-env=INSTANCE_ID)
+const instanceId = Deno.env.get('INSTANCE_ID') ?? 'my-app-instance-1';
+```
+
+**Deno filesystem permissions:**
+`deno run --allow-env=INSTANCE_ID --allow-read --allow-write=./.logbun app.ts`
 
 For Bun's built-in SQLite destination specifically, import
 `BunSQLiteAdapter` from `logbun/adapters/bun-sqlite` in a Bun-only module.

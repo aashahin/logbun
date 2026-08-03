@@ -108,7 +108,11 @@ export interface ReliabilityAdapter {
   acknowledgeJournal(ids: string[]): Promise<void>;
 
   /**
-   * Read unacked journal entries (bounded). Unread entries remain for later waves.
+   * Read unacked journal entries (bounded). A finite `maxBytes` is strict:
+   * returned encoded records never exceed it, and an oversized first record
+   * yields zero logs with `truncated: true`. Finite negative values normalize
+   * to zero; non-finite values are treated as unbounded. Unread entries remain
+   * available for a later call with a larger or absent bound.
    */
   recoverJournal(opts?: {
     maxLogs?: number;

@@ -21,6 +21,8 @@ import {
 } from './wal';
 import { DLQStorage, type DLQStorageOptions } from './dlq';
 import { InstanceLock } from './instance-lock';
+import { assertNoSymlinkPath, resolveLogbunDir } from './path';
+import { join } from 'node:path';
 
 export interface FileReliabilityWalOptions {
   /** fsync after each WAL append and compact. @default true */
@@ -109,6 +111,19 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
 
   async init(): Promise<void> {
     if (this.ready) return;
+
+    // Validate before the instance lock or WAL can create anything through a
+    // redirected ancestor. Storage implementations validate again after mkdir.
+    const root = resolveLogbunDir(this.namespace, this.dataDir);
+    await assertNoSymlinkPath(root, 'FileReliabilityAdapter data root');
+    await assertNoSymlinkPath(join(root, 'wal'), 'FileReliabilityAdapter WAL path');
+    await assertNoSymlinkPath(join(root, 'dlq'), 'FileReliabilityAdapter DLQ path');
+    if (this.wantLock) {
+      await assertNoSymlinkPath(
+        join(root, '.instance.lock'),
+        'FileReliabilityAdapter lock path',
+      );
+    }
 
     if (this.wantLock) {
       this.lock = new InstanceLock(this.namespace, this.dataDir);

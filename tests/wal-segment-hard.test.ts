@@ -163,7 +163,7 @@ test('hard maxBytes applies to encrypted bytes without writing a partial line', 
   await wal.close();
 });
 
-test('bounded recovery counts encoded bytes and returns one oversized first record', async () => {
+test('bounded recovery never returns an oversized first record', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'logbun-bounded-bytes-'));
   cleanupPaths.push(dataDir);
 
@@ -179,13 +179,17 @@ test('bounded recovery counts encoded bytes and returns one oversized first reco
     await wal.append(log(`${namespace}-second`, 120));
 
     const firstOnly = await wal.readAllBounded({ maxBytes: 1 });
-    expect(firstOnly.logs.map((item) => item.id)).toEqual([`${namespace}-large`]);
+    expect(firstOnly.logs).toEqual([]);
     expect(firstOnly.truncated).toBe(true);
 
     const total = await wal.approximateSize();
     const upToFirst = await wal.readAllBounded({ maxBytes: total - 1 });
     expect(upToFirst.logs).toHaveLength(1);
     expect(upToFirst.truncated).toBe(true);
+    expect((await wal.readAll()).map((item) => item.id)).toEqual([
+      `${namespace}-large`,
+      `${namespace}-second`,
+    ]);
     await wal.close();
   }
 });

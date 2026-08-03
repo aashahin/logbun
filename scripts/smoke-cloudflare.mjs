@@ -44,6 +44,22 @@ try {
   // Admit, intentionally remove the alarm, then tear down the entire workerd
   // isolate. The next instance must discover persisted work and restore it.
   await request('/admit?action=journal');
+  const strictBound = await request('/recovery?maxBytes=1');
+  if (strictBound.ids.length !== 0 || strictBound.truncated !== true) {
+    throw new Error('DO recovery returned a record larger than maxBytes');
+  }
+  for (const value of ['0', '-1']) {
+    const bounded = await request(`/recovery?maxBytes=${value}`);
+    if (bounded.ids.length !== 0 || bounded.truncated !== true) {
+      throw new Error(`DO recovery did not normalize maxBytes=${value} to a strict zero bound`);
+    }
+  }
+  for (const value of ['NaN', 'Infinity']) {
+    const unbounded = await request(`/recovery?maxBytes=${value}`);
+    if (unbounded.ids.length !== 1 || unbounded.truncated !== false) {
+      throw new Error(`DO recovery did not treat maxBytes=${value} as unbounded`);
+    }
+  }
   await request('/clear-alarm');
   await mf.dispose();
   mf = undefined;

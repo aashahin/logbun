@@ -421,6 +421,18 @@ export class DLQStorage {
     if (this.fsync) await this.fsyncDirectory();
   }
 
+  private async assertDestinationAbsent(path: string): Promise<void> {
+    this.assertUnderDir(path);
+    await this.assertSecureDirectory();
+    try {
+      await lstat(path);
+      throw new Error('dlq_state_collision: destination state already exists');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+  }
+
   private async unlinkSecurely(path: string): Promise<void> {
     await this.assertSecureExistingFile(path);
     await unlink(path);
@@ -631,15 +643,24 @@ export class DLQStorage {
    */
   async requeueDead(id: string): Promise<string> {
     return this.runWriteExclusive(async () => {
-      const resolved = await this.resolvePath(id);
-      if (!resolved || resolved.state !== 'dead') {
+      if (typeof id !== 'string' || !OPAQUE_ID_RE.test(id)) {
         throw new Error('requeueDead expects a dead DLQ entry id');
       }
-      this.assertUnderDir(resolved.path);
+      const deadPath = this.pathFor(id, 'dead');
+      try {
+        await this.assertSecureExistingFile(deadPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          throw new Error('requeueDead expects a dead DLQ entry id');
+        }
+        throw error;
+      }
+      const newPath = this.pathFor(id, 'pending');
+      await this.assertDestinationAbsent(newPath);
       await this.assertCanWriteUnlocked();
 
-      const batch = await this.readBatchFile(resolved.path);
-      const stableId = idFromFilename(resolved.path) || id;
+      const batch = await this.readBatchFile(deadPath);
+      const stableId = idFromFilename(deadPath) || id;
       const envelope: DLQBatchEnvelope = {
         v: 2,
         id: stableId,
@@ -647,10 +668,17 @@ export class DLQStorage {
         attempts: 0,
         logs: batch.logs,
       };
-      const newPath = this.pathFor(stableId, 'pending');
-      this.assertUnderDir(newPath);
-      await this.writeFileBody(newPath, JSON.stringify(envelope));
-      await this.unlinkSecurely(resolved.path);
+      // Reset metadata atomically while the entry is still dead. A crash here
+      // leaves one valid dead entry that can be retried. The following rename
+      // is the sole state transition and never creates pending+dead copies.
+      if (batch.v !== 2 || batch.id !== stableId || batch.attempts !== 0) {
+        await this.writeFileBody(deadPath, JSON.stringify(envelope));
+      }
+      await this.beforeAtomicRename?.(newPath);
+      // The hook models the last pre-rename fault/race boundary. Revalidate
+      // afterwards so a newly appeared pending state is never overwritten.
+      await this.assertDestinationAbsent(newPath);
+      await this.renameSecurely(deadPath, newPath);
       return stableId;
     });
   }

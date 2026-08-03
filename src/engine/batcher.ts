@@ -88,6 +88,8 @@ export class Batcher {
     new Map();
   /** Reserved slots awaiting WAL append (sync admit, before any await). */
   private readonly inflightReservations: Map<string, number> = new Map();
+  /** Monotonic generation used to detect reservations spanning an awaited read. */
+  private reservationEpoch = 0;
   /** Per-key flush serialization chain (belt + suspenders). */
   private readonly flushChains: Map<string, Promise<void>> = new Map();
   /** Remaining WAL recovery logs not yet injected (bounded inject). */
@@ -96,6 +98,8 @@ export class Batcher {
   private recoverySourceMayHaveMore = false;
   private recoveryLoad: Promise<boolean> | null = null;
   private recoveryPumpQueued = false;
+  /** A failed read is retried only when a host starts a later flush cycle. */
+  private recoveryRetryDeferred = false;
 
   private readonly config: BatchingConfig;
   private readonly mode: DurabilityMode;
@@ -390,6 +394,7 @@ export class Batcher {
    * in-flight safety — shutdown is best-effort after the deadline.
    */
   async flushAll(): Promise<void> {
+    this.recoveryRetryDeferred = false;
     this.drainRecoveryBacklog(true);
 
     const deadline =
@@ -614,9 +619,11 @@ export class Batcher {
     if (
       !this.recoveryLoader ||
       !this.recoverySourceMayHaveMore ||
+      this.recoveryRetryDeferred ||
       this.recoveryBacklog.length > 0 ||
       this.hasQueuedRecoveryWork() ||
-      this.inflightFlushes > 0
+      this.inflightFlushes > 0 ||
+      this.inflightReservations.size > 0
     ) {
       return false;
     }
@@ -624,7 +631,19 @@ export class Batcher {
 
     const run = (async (): Promise<boolean> => {
       try {
+        const reservationEpoch = this.reservationEpoch;
         const wave = await this.recoveryLoader!();
+        // A live enqueue can reserve and append while the adapter read is
+        // awaited. Discard that snapshot and reload after reservations settle;
+        // otherwise the appended record could be injected here and queued a
+        // second time when its live enqueue resumes.
+        if (
+          this.inflightReservations.size > 0 ||
+          this.reservationEpoch !== reservationEpoch
+        ) {
+          this.recoverySourceMayHaveMore = true;
+          return false;
+        }
         // An empty truncated response cannot make progress; stop rather than
         // spinning maintenance forever on a broken adapter.
         this.recoverySourceMayHaveMore =
@@ -633,7 +652,10 @@ export class Batcher {
         this.injectRecovered(wave.logs);
         return true;
       } catch (error) {
-        this.recoverySourceMayHaveMore = false;
+        // Preserve the source state so a later host-scheduled maintenance or
+        // flush can retry a transient adapter read. Do not reschedule here:
+        // that would turn a persistent failure into a tight microtask loop.
+        this.recoveryRetryDeferred = true;
         this.emit({
           type: 'flush_fail',
           count: 0,
@@ -647,7 +669,10 @@ export class Batcher {
     try {
       return await run;
     } finally {
-      if (this.recoveryLoad === run) this.recoveryLoad = null;
+      if (this.recoveryLoad === run) {
+        this.recoveryLoad = null;
+        this.scheduleRecoveryPump();
+      }
     }
   }
 
@@ -1091,6 +1116,7 @@ export class Batcher {
   }
 
   private reserve(key: string): void {
+    this.reservationEpoch++;
     this.inflightReservations.set(
       key,
       (this.inflightReservations.get(key) ?? 0) + 1
@@ -1101,6 +1127,9 @@ export class Batcher {
     const cur = this.inflightReservations.get(key) ?? 0;
     if (cur <= 1) this.inflightReservations.delete(key);
     else this.inflightReservations.set(key, cur - 1);
+    if (this.inflightReservations.size === 0) {
+      this.scheduleRecoveryPump();
+    }
   }
 
   private occupancy(key: string, queue: LogbunLog[]): number {

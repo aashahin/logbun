@@ -1,39 +1,23 @@
 import type { LogbunLog } from '../../types';
-import { resolveLogbunDir } from './path';
+import { assertNoSymlinkPath, resolveLogbunDir } from './path';
 import {
   decryptUtf8,
   encryptUtf8,
   type EncryptionKeyBytes,
 } from '../../utils/crypto';
 import {
-  appendFile,
+  lstat,
   mkdir,
   open,
   readdir,
+  realpath,
   rename,
-  stat,
   unlink,
-  writeFile,
 } from 'node:fs/promises';
-import { createReadStream } from 'node:fs';
+import { constants as FsConstants } from 'node:fs';
 import { Buffer } from 'node:buffer';
-import { join } from 'node:path';
-
-import { access, constants as FsConstants } from 'node:fs/promises';
-
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await access(path, FsConstants.F_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function readTextFile(path: string): Promise<string> {
-  const { readFile } = await import('node:fs/promises');
-  return readFile(path, 'utf8');
-}
+import { basename, isAbsolute, join, relative, resolve } from 'node:path';
+import { randomUUIDv7 } from '../../utils/uuidv7';
 
 
 /** Soft-size hint (64 MiB). Default maxWalBytes / hard refuse threshold. */
@@ -103,6 +87,7 @@ export interface WALReadBoundedResult {
  * All mutations serialized via `runExclusive`.
  */
 export class WALStorage {
+  private readonly namespaceDir: string;
   private readonly dir: string;
   private readonly path: string;
   private readonly ackPath: string;
@@ -123,7 +108,8 @@ export class WALStorage {
     dataDir?: string,
     options?: WALStorageOptions
   ) {
-    this.dir = join(resolveLogbunDir(namespace, dataDir), 'wal');
+    this.namespaceDir = resolve(resolveLogbunDir(namespace, dataDir));
+    this.dir = join(this.namespaceDir, 'wal');
     this.path = join(this.dir, 'current.aof');
     this.ackPath = join(this.dir, 'acked.ids');
     this.fsync = options?.fsync ?? true;
@@ -158,34 +144,138 @@ export class WALStorage {
     return run;
   }
 
-  async init(): Promise<void> {
-    await mkdir(this.dir, { recursive: true });
-    if (!(await fileExists(this.path))) {
-      await writeFile(this.path, '');
+  private noFollowFlag(): number {
+    if (typeof FsConstants.O_NOFOLLOW !== 'number') {
+      throw new Error(
+        'WAL secure file operations require O_NOFOLLOW support in this runtime',
+      );
     }
-    if (!(await fileExists(this.ackPath))) {
-      await writeFile(this.ackPath, '');
-    } else {
-      const ackText = await readTextFile(this.ackPath);
+    return FsConstants.O_NOFOLLOW;
+  }
+
+  private async assertSecureDirectory(): Promise<void> {
+    await assertNoSymlinkPath(this.namespaceDir, 'WAL namespace path');
+    await assertNoSymlinkPath(this.dir, 'WAL directory path');
+    const info = await lstat(this.dir);
+    if (info.isSymbolicLink()) {
+      throw new Error('WAL directory must not be a symbolic link');
+    }
+    if (!info.isDirectory()) {
+      throw new Error('WAL storage path is not a directory');
+    }
+    const physical = await realpath(this.dir);
+    if (physical !== resolve(this.dir)) {
+      throw new Error('WAL directory contains a symbolic link segment');
+    }
+  }
+
+  private async assertSecureFile(filePath: string): Promise<void> {
+    await this.assertSecureDirectory();
+    const info = await lstat(filePath);
+    if (info.isSymbolicLink()) {
+      throw new Error('WAL file must not be a symbolic link');
+    }
+    if (!info.isFile()) {
+      throw new Error('WAL entry is not a regular file');
+    }
+    const physical = await realpath(filePath);
+    const rel = relative(await realpath(this.dir), physical);
+    if (rel.startsWith('..') || isAbsolute(rel)) {
+      throw new Error('WAL file escaped its storage directory');
+    }
+  }
+
+  private async secureFileExists(filePath: string): Promise<boolean> {
+    try {
+      await lstat(filePath);
+      await this.assertSecureFile(filePath);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+  }
+
+  private async createSecureFile(filePath: string): Promise<void> {
+    await this.assertSecureDirectory();
+    const fh = await open(
+      filePath,
+      FsConstants.O_WRONLY |
+        FsConstants.O_CREAT |
+        FsConstants.O_EXCL |
+        this.noFollowFlag(),
+      0o600,
+    );
+    await fh.close();
+  }
+
+  private async ensureSecureFile(filePath: string): Promise<void> {
+    if (await this.secureFileExists(filePath)) return;
+    try {
+      await this.createSecureFile(filePath);
+    } catch (error) {
+      // `instanceLock: false` deliberately permits concurrent initializers.
+      // An exclusive-create loser may accept the winner only after validating
+      // that it is a confined regular file rather than an attacker symlink.
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+    await this.assertSecureFile(filePath);
+  }
+
+  private async openSecureFile(filePath: string, flags: number) {
+    await this.assertSecureFile(filePath);
+    return open(filePath, flags | this.noFollowFlag());
+  }
+
+  private async readTextFileSecure(filePath: string): Promise<string> {
+    const fh = await this.openSecureFile(filePath, FsConstants.O_RDONLY);
+    try {
+      return await fh.readFile({ encoding: 'utf8' });
+    } finally {
+      await fh.close();
+    }
+  }
+
+  private async appendTextSecure(filePath: string, body: string): Promise<void> {
+    const fh = await this.openSecureFile(
+      filePath,
+      FsConstants.O_WRONLY | FsConstants.O_APPEND,
+    );
+    try {
+      await fh.writeFile(body, 'utf8');
+      if (this.fsync) await fh.sync();
+    } finally {
+      await fh.close();
+    }
+  }
+
+  async init(): Promise<void> {
+    await assertNoSymlinkPath(this.namespaceDir, 'WAL namespace path');
+    await assertNoSymlinkPath(this.dir, 'WAL directory path');
+    await mkdir(this.dir, { recursive: true });
+    await this.assertSecureDirectory();
+    await this.ensureSecureFile(this.path);
+    const ackExisted = await this.secureFileExists(this.ackPath);
+    await this.ensureSecureFile(this.ackPath);
+    if (ackExisted) {
+      const ackText = await this.readTextFileSecure(this.ackPath);
       this.pendingAckCount = ackText
         .split('\n')
         .filter((l) => l.trim().length > 0).length;
     }
-    // Discover highest sealed segment index
-    try {
-      const entries = await readdir(this.dir);
-      let max = 0;
-      for (const e of entries) {
-        const m = /^seg-(\d+)\.aof$/.exec(e);
-        if (m) {
-          const n = parseInt(m[1]!, 10);
-          if (n > max) max = n;
-        }
+    // Discover highest sealed segment index. Security errors are fatal.
+    const entries = await readdir(this.dir);
+    let max = 0;
+    for (const e of entries) {
+      const m = /^seg-(\d+)\.aof$/.exec(e);
+      if (m) {
+        const n = parseInt(m[1]!, 10);
+        const segmentPath = join(this.dir, e);
+        await this.assertSecureFile(segmentPath);
+        if (n > max) max = n;
       }
-      this.nextSeg = max + 1;
-    } catch {
-      this.nextSeg = 1;
     }
+    this.nextSeg = max + 1;
     this.ready = true;
   }
 
@@ -217,10 +307,7 @@ export class WALStorage {
         await this.rotateCurrentUnlocked();
       }
 
-      await appendFile(this.path, encodedLine + '\n');
-      if (this.fsync) {
-        await this.fsyncFile(this.path);
-      }
+      await this.appendTextSecure(this.path, encodedLine + '\n');
     });
   }
 
@@ -238,7 +325,11 @@ export class WALStorage {
       maxLogs = maxLogsOrOpts;
     } else if (maxLogsOrOpts && typeof maxLogsOrOpts === 'object') {
       maxLogs = maxLogsOrOpts.maxLogs;
-      maxBytes = maxLogsOrOpts.maxBytes;
+      maxBytes =
+        typeof maxLogsOrOpts.maxBytes === 'number' &&
+        Number.isFinite(maxLogsOrOpts.maxBytes)
+          ? Math.max(0, maxLogsOrOpts.maxBytes)
+          : undefined;
     }
     return this.runExclusive(() => this.readPendingBoundedUnlocked(maxLogs, maxBytes));
   }
@@ -253,10 +344,7 @@ export class WALStorage {
     return this.runExclusive(async () => {
       const unique = [...new Set(ids)];
       const body = unique.map((id) => id + '\n').join('');
-      await appendFile(this.ackPath, body);
-      if (this.fsync) {
-        await this.fsyncFile(this.ackPath);
-      }
+      await this.appendTextSecure(this.ackPath, body);
       this.pendingAckCount += unique.length;
 
       if (this.pendingAckCount >= this.compactAckThreshold) {
@@ -279,12 +367,8 @@ export class WALStorage {
       const pending = await this.readPendingUnlocked();
       if (pending.length === 0) {
         await this.clearAllSegmentsUnlocked();
-        await writeFile(this.ackPath, '');
+        await this.rewriteText(this.ackPath, '');
         this.pendingAckCount = 0;
-        if (this.fsync) {
-          await this.fsyncFile(this.path);
-          await this.fsyncFile(this.ackPath);
-        }
       } else {
         await this.compactUnlocked();
       }
@@ -308,24 +392,29 @@ export class WALStorage {
     const segName = `seg-${String(this.nextSeg).padStart(6, '0')}.aof`;
     const segPath = join(this.dir, segName);
     this.nextSeg++;
-    await rename(this.path, segPath);
-    await writeFile(this.path, '');
-    if (this.fsync) {
-      await this.fsyncFile(this.path);
+    await this.assertSecureFile(this.path);
+    if (await this.secureFileExists(segPath)) {
+      throw new Error(`WAL segment collision: ${segName}`);
     }
+    await rename(this.path, segPath);
+    await this.createSecureFile(this.path);
   }
 
   private async listSegmentPathsUnlocked(): Promise<string[]> {
+    await this.assertSecureDirectory();
     let entries: string[];
     try {
       entries = await readdir(this.dir);
-    } catch {
-      return [];
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
     }
-    return entries
+    const paths = entries
       .filter((e) => /^seg-\d+\.aof$/.test(e))
       .sort()
       .map((e) => join(this.dir, e));
+    for (const path of paths) await this.assertSecureFile(path);
+    return paths;
   }
 
   private async aofPathsInOrderUnlocked(): Promise<string[]> {
@@ -349,9 +438,10 @@ export class WALStorage {
         survivors.push(...kept);
       } else if (kept.length === 0) {
         try {
+          await this.assertSecureFile(p);
           await unlink(p);
-        } catch {
-          /* ignore */
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
         }
       } else {
         // Rewrite sealed segment in place (bounded to that segment's unacked set)
@@ -364,10 +454,7 @@ export class WALStorage {
     // After compact, sealed segs that still exist are already filtered; current holds
     // only what was in current. Optionally absorb tiny sealed segs into current later.
 
-    await writeFile(this.ackPath, '');
-    if (this.fsync) {
-      await this.fsyncFile(this.ackPath);
-    }
+    await this.rewriteText(this.ackPath, '');
     this.pendingAckCount = 0;
   }
 
@@ -375,12 +462,13 @@ export class WALStorage {
     const segs = await this.listSegmentPathsUnlocked();
     for (const p of segs) {
       try {
+        await this.assertSecureFile(p);
         await unlink(p);
-      } catch {
-        /* ignore */
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       }
     }
-    await writeFile(this.path, '');
+    await this.rewriteText(this.path, '');
   }
 
   private async readPendingUnlocked(): Promise<LogbunLog[]> {
@@ -410,15 +498,9 @@ export class WALStorage {
           truncated = true;
           return 'stop';
         }
-        // A single large record is returned so a recovery pump always makes
-        // progress; it also ends this wave so it cannot read without bound.
+        // Strict bound: leave an oversized record unread/unacked so callers
+        // can retry with a larger (or absent) byte limit.
         if (hasByteCap && readBytes + encodedBytes > (maxBytes as number)) {
-          if (logs.length > 0) {
-            truncated = true;
-            return 'stop';
-          }
-          logs.push(log);
-          readBytes += encodedBytes;
           truncated = true;
           return 'stop';
         }
@@ -440,9 +522,8 @@ export class WALStorage {
     filePath: string,
     onLog: (log: LogbunLog, encodedBytes: number) => 'continue' | 'stop' | void
   ): Promise<boolean> {
-    if (!(await fileExists(filePath))) return false;
-
-    const stream = createReadStream(filePath);
+    if (!(await this.secureFileExists(filePath))) return false;
+    const fh = await this.openSecureFile(filePath, FsConstants.O_RDONLY);
     let carry = Buffer.alloc(0);
     const processLine = async (rawBytes: Buffer, encodedBytes: number) => {
       // Tolerate CRLF migration input while preserving its physical byte count.
@@ -466,8 +547,16 @@ export class WALStorage {
       return false;
     };
     try {
-      for await (const chunk of stream) {
-        const incoming = Buffer.from(chunk);
+      const readBuffer = Buffer.allocUnsafe(64 * 1024);
+      for (;;) {
+        const { bytesRead } = await fh.read(
+          readBuffer,
+          0,
+          readBuffer.length,
+          null,
+        );
+        if (bytesRead === 0) break;
+        const incoming = Buffer.from(readBuffer.subarray(0, bytesRead));
         const data = carry.length > 0 ? Buffer.concat([carry, incoming]) : incoming;
         let start = 0;
         for (;;) {
@@ -486,7 +575,7 @@ export class WALStorage {
         return true;
       }
     } finally {
-      stream.destroy();
+      await fh.close();
     }
     return false;
   }
@@ -502,17 +591,22 @@ export class WALStorage {
 
   private async sizeOfFileUnlocked(filePath: string): Promise<number> {
     try {
-      // Prefer node:fs stat — Bun.file().size can lag behind appendFile writes
-      const st = await stat(filePath);
-      return typeof st.size === 'number' && Number.isFinite(st.size) ? st.size : 0;
-    } catch {
+      const fh = await this.openSecureFile(filePath, FsConstants.O_RDONLY);
+      try {
+        const st = await fh.stat();
+        return typeof st.size === 'number' && Number.isFinite(st.size) ? st.size : 0;
+      } finally {
+        await fh.close();
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       return 0;
     }
   }
 
   private async readAckedIdsUnlocked(): Promise<Set<string>> {
-    if (!(await fileExists(this.ackPath))) return new Set();
-    const content = await readTextFile(this.ackPath);
+    if (!(await this.secureFileExists(this.ackPath))) return new Set();
+    const content = await this.readTextFileSecure(this.ackPath);
     if (!content.trim()) return new Set();
     const set = new Set<string>();
     for (const line of content.split('\n')) {
@@ -528,12 +622,46 @@ export class WALStorage {
       lines.push(await this.encodeLogLine(l));
     }
     const body = lines.length === 0 ? '' : lines.join('\n') + '\n';
-    const tempPath = `${path}.tmp`;
-    await writeFile(tempPath, body);
-    if (this.fsync) {
-      await this.fsyncFile(tempPath);
+    await this.rewriteText(path, body);
+  }
+
+  private async rewriteText(path: string, body: string): Promise<void> {
+    await this.assertSecureFile(path);
+    let tempPath: string | null = null;
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const candidate = join(
+          this.dir,
+          `.${basename(path)}.${randomUUIDv7()}.tmp`,
+        );
+        try {
+          const fh = await open(
+            candidate,
+            FsConstants.O_WRONLY |
+              FsConstants.O_CREAT |
+              FsConstants.O_EXCL |
+              this.noFollowFlag(),
+            0o600,
+          );
+          try {
+            await fh.writeFile(body, 'utf8');
+            if (this.fsync) await fh.sync();
+          } finally {
+            await fh.close();
+          }
+          tempPath = candidate;
+          break;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+      }
+      if (!tempPath) throw new Error('WAL could not create a unique temporary file');
+      await this.assertSecureFile(path);
+      await rename(tempPath, path);
+      tempPath = null;
+    } finally {
+      if (tempPath) await unlink(tempPath).catch(() => undefined);
     }
-    await rename(tempPath, path);
   }
 
   private async encodeLogLine(log: LogbunLog): Promise<string> {
@@ -543,12 +671,4 @@ export class WALStorage {
       : plain;
   }
 
-  private async fsyncFile(filePath: string): Promise<void> {
-    const fh = await open(filePath, 'r+');
-    try {
-      await fh.sync();
-    } finally {
-      await fh.close();
-    }
-  }
 }

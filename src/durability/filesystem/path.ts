@@ -4,7 +4,8 @@
  *
  * Deno: grant `--allow-read` and `--allow-write` for the data directory.
  */
-import { join } from 'node:path';
+import { lstat, realpath } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { sanitizeNamespace } from '../../utils/namespace';
 
 export { sanitizeNamespace };
@@ -30,6 +31,39 @@ export function resolveLogbunDir(namespace: string, dataDir?: string): string {
   }
 
   return join(root, ns);
+}
+
+/**
+ * Validate the nearest existing ancestor before creating a filesystem root.
+ * A realpath mismatch means some lexical path segment is a symbolic link.
+ */
+export async function assertNoSymlinkPath(
+  targetPath: string,
+  label = 'Logbun filesystem path',
+): Promise<void> {
+  let candidate = resolve(targetPath);
+  for (;;) {
+    try {
+      const info = await lstat(candidate);
+      if (info.isSymbolicLink()) {
+        throw new Error(`${label} must not contain a symbolic link`);
+      }
+      const physical = await realpath(candidate);
+      if (physical !== candidate) {
+        throw new Error(`${label} must not contain a symbolic link`);
+      }
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') {
+        const parent = dirname(candidate);
+        if (parent === candidate) return;
+        candidate = parent;
+        continue;
+      }
+      throw error;
+    }
+  }
 }
 
 /** Shared-contract alias for {@link resolveLogbunDir}. */

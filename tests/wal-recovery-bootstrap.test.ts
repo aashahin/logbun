@@ -182,3 +182,221 @@ test('AuditLogger.runMaintenance drains every filesystem recovery wave', async (
   expect((await verify.recoverJournal()).logs).toEqual([]);
   await verify.close();
 });
+
+test('maintenance retries a transient recovery-wave failure without duplicate delivery', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-wal-recovery-retry-'));
+  cleanupPaths.push(dataDir);
+  const seedWal = new WALStorage('retry-waves', dataDir, { fsync: false });
+  await seedWal.init();
+  const ids = ['retry-wave-1', 'retry-wave-2'];
+  for (const id of ids) await seedWal.append(makeLog(id));
+  await seedWal.close();
+
+  const inserts: string[] = [];
+  const adapter: IAdapter = {
+    async init() {},
+    async bulkInsert(_tenantId, logs) {
+      inserts.push(...logs.map((log) => log.id));
+      return true;
+    },
+    async query(
+      _t: string | null,
+      _f: LogbunQueryFilters,
+      _p: { cursor?: string; limit: number },
+    ): Promise<LogbunQueryResult> {
+      return { logs: [], nextCursor: null };
+    },
+    async prune() {},
+    async close() {},
+  };
+
+  const reliability = makeFileReliability('retry-waves', dataDir);
+  const recoverJournal = reliability.recoverJournal.bind(reliability);
+  let recoveryCalls = 0;
+  reliability.recoverJournal = async (options) => {
+    recoveryCalls++;
+    if (recoveryCalls === 2) throw new Error('transient recovery read');
+    return recoverJournal(options);
+  };
+
+  const audit = new AuditLogger({
+    namespace: 'retry-waves',
+    reliability,
+    mode: 'durable',
+    adapter,
+    maxRecoveryBatch: 1,
+    batching: { maxSize: 10, flushInterval: 60_000, maxQueueSize: 20, onQueueFull: 'dlq' },
+  });
+  await audit.ready;
+
+  await audit.runMaintenance();
+  expect(recoveryCalls).toBe(2);
+  expect(inserts).toEqual(['retry-wave-1']);
+
+  await audit.runMaintenance();
+  expect(recoveryCalls).toBe(3);
+  expect(inserts.sort()).toEqual(ids);
+  expect(new Set(inserts).size).toBe(ids.length);
+  await audit.shutdown();
+});
+
+test('truncated recovery and a delayed live append deliver every journal id exactly once', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-wal-reservation-'));
+  cleanupPaths.push(dataDir);
+  const seedWal = new WALStorage('reservation-waves', dataDir, { fsync: false });
+  await seedWal.init();
+  const recoveredIds = ['reservation-wave-1', 'reservation-wave-2'];
+  for (const id of recoveredIds) await seedWal.append(makeLog(id));
+  await seedWal.close();
+
+  const inserts: string[] = [];
+  const adapter: IAdapter = {
+    async init() {},
+    async bulkInsert(_tenantId, logs) {
+      inserts.push(...logs.map((log) => log.id));
+      return true;
+    },
+    async query(
+      _t: string | null,
+      _f: LogbunQueryFilters,
+      _p: { cursor?: string; limit: number },
+    ): Promise<LogbunQueryResult> {
+      return { logs: [], nextCursor: null };
+    },
+    async prune() {},
+    async close() {},
+  };
+
+  const reliability = makeFileReliability('reservation-waves', dataDir);
+  const appendJournal = reliability.appendJournal.bind(reliability);
+  let liveId = '';
+  let signalAppendStarted!: () => void;
+  const appendStarted = new Promise<void>((resolve) => {
+    signalAppendStarted = resolve;
+  });
+  let releaseAppend!: () => void;
+  const appendGate = new Promise<void>((resolve) => {
+    releaseAppend = resolve;
+  });
+  reliability.appendJournal = async (log) => {
+    await appendJournal(log);
+    if (log.action === 'live.reservation') {
+      liveId = log.id;
+      signalAppendStarted();
+      await appendGate;
+    }
+  };
+
+  const audit = new AuditLogger({
+    namespace: 'reservation-waves',
+    reliability,
+    mode: 'durable',
+    adapter,
+    maxRecoveryBatch: 1,
+    batching: { maxSize: 10, flushInterval: 60_000, maxQueueSize: 20, onQueueFull: 'dlq' },
+  });
+  await audit.ready;
+
+  const liveEnqueue = audit.fireAsync('live.reservation', { actorId: 'actor-live' });
+  await appendStarted;
+  await audit.runMaintenance();
+
+  releaseAppend();
+  await liveEnqueue;
+  await audit.runMaintenance();
+
+  const expectedIds = [...recoveredIds, liveId].sort();
+  expect(liveId).not.toBe('');
+  expect(inserts.sort()).toEqual(expectedIds);
+  expect(new Set(inserts).size).toBe(expectedIds.length);
+  await audit.shutdown();
+});
+
+test('a reservation completed during an awaited recovery read prevents duplicate injection', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-wal-mid-read-reservation-'));
+  cleanupPaths.push(dataDir);
+  const namespace = 'mid-read-reservation';
+  const seedWal = new WALStorage(namespace, dataDir, { fsync: false });
+  await seedWal.init();
+  const recoveredIds = ['mid-read-wave-1', 'mid-read-wave-2'];
+  for (const id of recoveredIds) await seedWal.append(makeLog(id));
+  await seedWal.close();
+
+  const inserts: string[] = [];
+  const adapter: IAdapter = {
+    async init() {},
+    async bulkInsert(_tenantId, logs) {
+      inserts.push(...logs.map((log) => log.id));
+      return true;
+    },
+    async query(
+      _t: string | null,
+      _f: LogbunQueryFilters,
+      _p: { cursor?: string; limit: number },
+    ): Promise<LogbunQueryResult> {
+      return { logs: [], nextCursor: null };
+    },
+    async prune() {},
+    async close() {},
+  };
+
+  const reliability = makeFileReliability(namespace, dataDir);
+  const recoverJournal = reliability.recoverJournal.bind(reliability);
+  const appendJournal = reliability.appendJournal.bind(reliability);
+  let liveLog: LogbunLog | null = null;
+  let recoveryCalls = 0;
+  let signalRecoveryStarted!: () => void;
+  const recoveryStarted = new Promise<void>((resolve) => {
+    signalRecoveryStarted = resolve;
+  });
+  let releaseRecovery!: () => void;
+  const recoveryGate = new Promise<void>((resolve) => {
+    releaseRecovery = resolve;
+  });
+  reliability.recoverJournal = async (options) => {
+    recoveryCalls++;
+    if (recoveryCalls === 2) {
+      signalRecoveryStarted();
+      await recoveryGate;
+      return { logs: [liveLog!], truncated: false, approxBytes: 0 };
+    }
+    return recoverJournal(options);
+  };
+
+  let signalAppendStarted!: () => void;
+  const appendStarted = new Promise<void>((resolve) => {
+    signalAppendStarted = resolve;
+  });
+  reliability.appendJournal = async (log) => {
+    await appendJournal(log);
+    if (log.action === 'live.mid-read') {
+      liveLog = log;
+      signalAppendStarted();
+    }
+  };
+
+  const audit = new AuditLogger({
+    namespace,
+    reliability,
+    mode: 'durable',
+    adapter,
+    maxRecoveryBatch: 1,
+    batching: { maxSize: 10, flushInterval: 60_000, maxQueueSize: 20, onQueueFull: 'dlq' },
+  });
+  await audit.ready;
+
+  const maintenance = audit.runMaintenance();
+  await recoveryStarted;
+  const liveEnqueue = audit.fireAsync('live.mid-read', { actorId: 'actor-live' });
+  await appendStarted;
+  await liveEnqueue;
+  releaseRecovery();
+  await maintenance;
+
+  await audit.runMaintenance();
+
+  const expectedIds = [...recoveredIds, liveLog!.id].sort();
+  expect(inserts.sort()).toEqual(expectedIds);
+  expect(new Set(inserts).size).toBe(expectedIds.length);
+  await audit.shutdown();
+});
