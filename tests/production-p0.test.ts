@@ -1,3 +1,4 @@
+import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -6,9 +7,9 @@ import { join } from 'node:path';
 import { Batcher } from '../src/engine/batcher';
 import { ConnectionPool } from '../src/engine/pool';
 import { AuditLogger } from '../src/logger';
-import { BunSQLiteAdapter } from '../src/adapters/sqlite';
-import { DLQStorage, readBatch } from '../src/storage/dlq';
-import { WALStorage } from '../src/storage/wal';
+import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
+import { DLQStorage, readBatch } from '../src/durability/filesystem';
+import { WALStorage } from '../src/durability/filesystem';
 import { sanitizeTenantKey } from '../src/utils/tenant';
 import type { IAdapter, LogbunLog, LogbunQueryFilters, LogbunQueryResult } from '../src/types';
 
@@ -75,24 +76,24 @@ test('flushAll_keeps_unacked_wal_when_adapter_and_dlq_both_fail', async () => {
 
   const adapter = stubAdapter({ failInsert: true });
   const pool = new ConnectionPool(adapter, 5);
-  const wal = new WALStorage('p0-trunc', dataDir, {
-    fsync: false,
-    compactAckThreshold: 10_000,
+  const real = makeFileReliability('p0-trunc', dataDir);
+  await real.init();
+  const rel = new Proxy(real, {
+    get(target, prop, receiver) {
+      if (prop === 'writeDlq') {
+        return async () => {
+          throw new Error('disk full');
+        };
+      }
+      const v = Reflect.get(target, prop, receiver);
+      return typeof v === 'function' ? (v as Function).bind(target) : v;
+    },
   });
-  await wal.init();
-
-  const realDlq = new DLQStorage('p0-trunc', dataDir);
-  await realDlq.init();
-  const dlq: DLQStorage = Object.create(realDlq) as DLQStorage;
-  dlq.write = async () => {
-    throw new Error('disk full');
-  };
 
   const batcher = new Batcher({
     adapter,
     pool,
-    wal,
-    dlq,
+    reliability: rel,
     mode: 'durable',
     batching: {
       maxSize: 10,
@@ -105,13 +106,15 @@ test('flushAll_keeps_unacked_wal_when_adapter_and_dlq_both_fail', async () => {
 
   await batcher.enqueue(makeLog('keep-1'));
   await batcher.enqueue(makeLog('keep-2'));
-  expect((await wal.readAll()).map((l) => l.id).sort()).toEqual(['keep-1', 'keep-2']);
+  const before = await real.recoverJournal();
+  expect(before.logs.map((l) => l.id).sort()).toEqual(['keep-1', 'keep-2']);
 
   await batcher.flushAll();
 
   // Unacked logs must remain recoverable after shutdown drain
-  expect((await wal.readAll()).map((l) => l.id).sort()).toEqual(['keep-1', 'keep-2']);
-  await wal.close();
+  const after = await real.recoverJournal();
+  expect(after.logs.map((l) => l.id).sort()).toEqual(['keep-1', 'keep-2']);
+  await real.close();
 });
 
 test('dlq_write_with_path_traversal_tenant_stays_inside_dlq_dir', async () => {
@@ -121,10 +124,11 @@ test('dlq_write_with_path_traversal_tenant_stays_inside_dlq_dir', async () => {
   const dlq = new DLQStorage('p0-path', dataDir);
   await dlq.init();
 
+
   const evil = '../../etc/passwd';
   await dlq.write(evil, [makeLog('evil-1', evil)]);
 
-  const pending = await dlq.listPending();
+  const pending = await dlq.listPendingPaths();
   expect(pending).toHaveLength(1);
   expect(pending[0]!.startsWith(dlq.directory + '/')).toBe(true);
   expect(pending[0]!.includes('..')).toBe(false);
@@ -133,8 +137,9 @@ test('dlq_write_with_path_traversal_tenant_stays_inside_dlq_dir', async () => {
   expect(batch.tenantId).toBe(evil);
   expect(batch.logs.map((l) => l.id)).toEqual(['evil-1']);
 
-  const base = pending[0]!.split('/').pop()!;
-  expect(base.startsWith(sanitizeTenantKey(evil))).toBe(true);
+  // Opaque UUID filenames; tenant lives in envelope (path stays under dlq dir)
+  expect(pending[0]!.startsWith(dlq.directory)).toBe(true);
+  expect(batch.tenantId).toBe(evil);
 });
 
 test.each([
@@ -213,7 +218,6 @@ test('requireTenantId_drops_fire_and_rejects_query_without_tenant', async () => 
     namespace: 'p0-tenant',
     mode: 'volatile',
     adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-    dataDir,
     requireTenantId: true,
     batching: { maxSize: 1, flushInterval: 20 },
     onEvent: (e) => events.push(`${e.type}:${e.detail ?? ''}`),
@@ -241,7 +245,6 @@ test('oversized_payload_emits_truncated_not_drop', async () => {
     namespace: 'p0-tev',
     mode: 'volatile',
     adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-    dataDir,
     maxPayloadBytes: 50,
     onEvent: (e) => events.push(e.type),
   });
@@ -285,7 +288,6 @@ test('pre_ready_buffer_drops_when_over_maxPreReadyBuffer', async () => {
     namespace: 'p0-pre',
     mode: 'volatile',
     adapter,
-    dataDir,
     maxPreReadyBuffer: 3,
     onEvent: (e) => {
       if (e.type === 'drop') drops.push(e.detail ?? '');
@@ -311,17 +313,18 @@ test('dlq_requeueDead_moves_poison_back_to_pending', async () => {
   const dlq = new DLQStorage('p0-ops', dataDir);
   await dlq.init();
   await dlq.write('t1', [makeLog('d1', 't1')]);
-  const [pending] = await dlq.listPending();
+  const [pending] = await dlq.listPendingPaths();
   const processing = await dlq.markProcessing(pending!);
   await dlq.markPoisoned(processing);
 
   expect(await dlq.listDead()).toHaveLength(1);
-  const requeued = await dlq.requeueDead((await dlq.listDead())[0]!);
-  expect(requeued.endsWith('.batch')).toBe(true);
+  const deadId = (await dlq.listDead())[0]!;
+  const requeued = await dlq.requeueDead(deadId);
+  expect(requeued).toBe(deadId); // preserves opaque id
   expect(await dlq.listDead()).toHaveLength(0);
-  expect(await dlq.listPending()).toHaveLength(1);
+  expect(await dlq.listPendingPaths()).toHaveLength(1);
 
-  const batch = await readBatch((await dlq.listPending())[0]!);
+  const batch = await readBatch((await dlq.listPendingPaths())[0]!);
   expect(batch.attempts).toBe(0);
   expect(batch.logs.map((l) => l.id)).toEqual(['d1']);
 });
@@ -335,7 +338,6 @@ test('successful_enqueue_emits_enqueue_event', async () => {
     namespace: 'p0-enq',
     mode: 'volatile',
     adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-    dataDir,
     batching: { flushInterval: 60_000, maxSize: 100 },
     onEvent: (e) => events.push(e.type),
   });
@@ -357,11 +359,12 @@ test('injectRecovered_respects_maxRecoveryBatch_then_drains_all', async () => {
   const dlq = new DLQStorage('p0-rec', dataDir);
   await dlq.init();
 
+    const rel = makeFileReliability('p0-rec', dataDir);
+    await rel.init();
   const batcher = new Batcher({
     adapter,
     pool,
-    wal: null,
-    dlq,
+    reliability: rel,
     mode: 'volatile',
     batching: {
       maxSize: 100,
@@ -384,10 +387,9 @@ test('fire_during_shutdown_durable_still_reaches_dlq', async () => {
 
   const audit = new AuditLogger({
     namespace: 'p0-shut',
+    reliability: makeFileReliability('p0-shut', dataDir),
     mode: 'durable',
     adapter: stubAdapter({ failInsert: true }),
-    dataDir,
-    wal: { fsync: false },
     batching: { maxSize: 100, flushInterval: 60_000, onQueueFull: 'dlq' },
     retry: { insertMaxRetries: 0, insertBaseDelayMs: 1, initialDelayMs: 60_000 },
   });
@@ -401,7 +403,7 @@ test('fire_during_shutdown_durable_still_reaches_dlq', async () => {
   // After full shutdown engine is null; re-open DLQ for the namespace
   const dlq = new DLQStorage('p0-shut', dataDir);
   await dlq.init();
-  const pending = await dlq.listPending();
+  const pending = await dlq.listPendingPaths();
   // Either landed in DLQ during shutdown, or was dropped only if volatile —
   // durable path should leave at least WAL or DLQ evidence. Prefer DLQ.
   const wal = new WALStorage('p0-shut', dataDir, { fsync: false });

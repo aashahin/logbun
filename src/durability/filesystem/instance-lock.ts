@@ -11,12 +11,14 @@
  * - **Not safe on NFS** (or other network filesystems with weak exclusive-create /
  *   cache coherence): use a single local disk, or disable and coordinate externally.
  * - Holds the lock file handle open for the process lifetime after acquire.
+ *
+ * Deno: requires `--allow-read` / `--allow-write` on the data directory.
  */
 
 import { open as fsOpen, unlink, readFile, mkdir } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { resolveLogbunDir } from '../utils/path';
+import { resolveLogbunDir } from './path';
 
 export class InstanceLockError extends Error {
   constructor(message: string) {
@@ -28,7 +30,6 @@ export class InstanceLockError extends Error {
 function pidAlive(pid: number): boolean {
   if (!Number.isFinite(pid) || pid <= 0) return false;
   try {
-    // signal 0 — existence check; throws ESRCH if gone
     process.kill(pid, 0);
     return true;
   } catch (err) {
@@ -36,23 +37,17 @@ function pidAlive(pid: number): boolean {
       err && typeof err === 'object' && 'code' in err
         ? (err as { code?: string }).code
         : undefined;
-    // EPERM: process exists but we cannot signal it — treat as alive
     if (code === 'EPERM') return true;
     return false;
   }
 }
 
-/** Parse holder PID from lock file contents (`pid` or `pid\nstartTime`). */
 function parseLockPid(raw: string): number {
   const line = raw.trim().split(/\r?\n/)[0] ?? '';
   const pid = parseInt(line, 10);
   return Number.isFinite(pid) ? pid : 0;
 }
 
-/**
- * Approximate process start time (ms since epoch) for lock payload.
- * Helps operators distinguish holders; not used for steal decisions.
- */
 function processStartTimeMs(): number {
   return Math.floor(Date.now() - process.uptime() * 1000);
 }
@@ -70,10 +65,6 @@ export class InstanceLock {
     return this.path;
   }
 
-  /**
-   * Acquire exclusive lock. Throws {@link InstanceLockError} if another live
-   * process holds it.
-   */
   async acquire(): Promise<void> {
     if (this.handle) return;
 
@@ -81,9 +72,7 @@ export class InstanceLock {
 
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        // Exclusive create — fails if file exists; keep handle open for process lifetime
         this.handle = await fsOpen(this.path, 'wx');
-        // Format: pid\nstartTime — parseInt of first line remains backward-compatible
         await this.handle.writeFile(
           `${process.pid}\n${processStartTimeMs()}\n`,
           'utf8'
@@ -101,7 +90,6 @@ export class InstanceLock {
             : new Error(`instance lock acquire failed: ${String(err)}`);
         }
 
-        // Stale lock? steal if PID is dead
         let holderPid = 0;
         try {
           const raw = await readFile(this.path, 'utf8');
@@ -117,11 +105,10 @@ export class InstanceLock {
           );
         }
 
-        // Dead or unreadable — remove and retry (only one wx wins after unlink)
         try {
           await unlink(this.path);
         } catch {
-          /* race: another process recreated — loop */
+          /* race */
         }
       }
     }
@@ -131,11 +118,6 @@ export class InstanceLock {
     );
   }
 
-  /**
-   * Release lock and remove the lock file if we still own it.
-   * Idempotent. Only unlinks when the file's recorded PID matches this process
-   * (avoids deleting another process's lock after a steal race).
-   */
   async release(): Promise<void> {
     if (this.handle) {
       try {
@@ -153,7 +135,7 @@ export class InstanceLock {
       }
       await unlink(this.path);
     } catch {
-      /* already gone or unreadable */
+      /* already gone */
     }
   }
 }

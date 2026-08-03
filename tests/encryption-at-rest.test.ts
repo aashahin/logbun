@@ -3,8 +3,8 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { WALStorage } from '../src/storage/wal';
-import { DLQStorage } from '../src/storage/dlq';
+import { WALStorage } from '../src/durability/filesystem';
+import { DLQStorage } from '../src/durability/filesystem';
 import { normalizeEncryptionKey, ENC_PREFIX } from '../src/utils/crypto';
 import type { LogbunLog } from '../src/types';
 
@@ -34,9 +34,9 @@ test('WAL encrypts lines at rest; decrypts on read', async () => {
   const key = await normalizeEncryptionKey('test-passphrase-for-logbun-enc');
   const wal = new WALStorage('enc', dataDir, {
     fsync: false,
-    encryptionKey: key,
     hardMaxBytes: false,
     compactAckThreshold: 10_000,
+    encryptionKey: key,
   });
   await wal.init();
   await wal.append(makeLog('e1'));
@@ -67,7 +67,7 @@ test('DLQ encrypts batch body at rest', async () => {
   await dlq.init();
   await dlq.write('t1', [makeLog('d1')]);
 
-  const pending = await dlq.listPending();
+  const pending = await dlq.listPendingPaths();
   expect(pending).toHaveLength(1);
   const raw = await readFile(pending[0]!, 'utf8');
   expect(raw.startsWith(ENC_PREFIX) || raw.includes(ENC_PREFIX)).toBe(true);

@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { BunSQLiteAdapter } from '../src/adapters/sqlite';
+import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
 import { ConnectionPool } from '../src/engine/pool';
 import type { IAdapter, LogbunQueryFilters, LogbunQueryResult } from '../src/types';
 

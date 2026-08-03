@@ -2,10 +2,15 @@
 
 Adapters implement `IAdapter` and are **tree-shaken** via package subpath exports. Install only the peer deps you need.
 
+Destination adapters store audit records; reliability adapters own journals and
+DLQs. For durable mode, pair one destination below with
+`FileReliabilityAdapter` (Node/Bun/Deno) or `CloudflareReliabilityAdapter`
+(inside a Durable Object).
+
 ## BunSQLiteAdapter
 
 ```typescript
-import { BunSQLiteAdapter } from 'logbun/adapters/sqlite';
+import { BunSQLiteAdapter } from 'logbun/adapters/bun-sqlite';
 
 const adapter = new BunSQLiteAdapter({
   path: '.logbun/audit.db',      // default
@@ -54,9 +59,15 @@ const adapter = new TursoAdapter({
 ### database_per_tenant example
 
 ```typescript
+import { FileReliabilityAdapter } from 'logbun/durability/filesystem';
+
 const audit = new AuditLogger({
   namespace: process.env.INSTANCE_ID!,
   mode: 'durable',
+  reliability: new FileReliabilityAdapter({
+    namespace: process.env.INSTANCE_ID!,
+    dataDir: '.logbun',
+  }),
   adapter: new TursoAdapter({
     url: process.env.TURSO_URL!,
     authToken: process.env.TURSO_TOKEN!,

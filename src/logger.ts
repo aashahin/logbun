@@ -1,5 +1,5 @@
 import type {
-  DLQFileInfo,
+  DLQEntry,
   LogbunConfig,
   LogbunEvent,
   LogbunLogInput,
@@ -8,7 +8,7 @@ import type {
   LogbunQueryResult,
   LogbunRequestContext,
 } from './types';
-import { bootstrap, type BootstrapResult } from './bootstrap';
+import { bootstrap, runRetentionPrune, type BootstrapResult } from './bootstrap';
 import { safeEmit } from './events';
 import { capString } from './utils/json';
 import { isTenantIdPresent } from './utils/tenant';
@@ -17,6 +17,7 @@ import {
   sealIntegrity,
   verifyIntegrityChain,
 } from './utils/crypto';
+import { randomUUIDv7 } from './utils/uuidv7';
 
 const DEFAULT_MAX_QUERY_LIMIT = 500;
 const DEFAULT_MAX_PAYLOAD_BYTES = 64_000;
@@ -38,13 +39,13 @@ export interface AuditLoggerStats {
   recoveryBacklog: number;
   /** Concurrent bulkInsert flush paths currently in flight. */
   inflightFlushes: number;
-  /** Best-effort WAL AOF size in bytes; 0 if no WAL / not ready. Filled by getStatsDetailed. */
+  /** Best-effort journal size in bytes; 0 if volatile / not ready. Filled by getStatsDetailed. */
   walApproxBytes?: number;
-  /** Pending DLQ batch file count. Filled by getStatsDetailed. */
+  /** Pending DLQ entry count. Filled by getStatsDetailed. */
   dlqPending?: number;
-  /** In-flight (`.processing`) DLQ batch file count. Filled by getStatsDetailed. */
+  /** In-flight (processing) DLQ entry count. Filled by getStatsDetailed. */
   dlqProcessing?: number;
-  /** Poisoned (`.dead`) DLQ batch file count. Filled by getStatsDetailed. */
+  /** Poisoned (dead) DLQ entry count. Filled by getStatsDetailed. */
   dlqDead?: number;
 }
 
@@ -56,6 +57,7 @@ export interface AuditLoggerStats {
  * const audit = new AuditLogger<MyActions>({
  *   namespace: 'my-app',
  *   mode: 'durable',
+ *   reliability: new FileReliabilityAdapter({ namespace: 'my-app', dataDir }),
  *   adapter: new BunSQLiteAdapter(),
  *   requireTenantId: true, // recommended for multi-tenant SaaS
  * });
@@ -63,14 +65,17 @@ export interface AuditLoggerStats {
  * await audit.ready;
  * audit.fire('user.created', { actorId: 'u1', tenantId: 't1', entityId: 'u2' });
  * await audit.fireAsync('user.updated', { actorId: 'u1', tenantId: 't1' });
+ * await audit.runMaintenance(); // host-scheduled flush + DLQ retry + retention
  * await audit.shutdown();
  * ```
  *
  * Notes:
- * - {@link fire} is never-throws fire-and-forget (`void enqueue.catch`).
- * - {@link fireAsync} awaits full enqueue (including WAL in durable mode) and may reject.
+ * - {@link fire} is never-throws fire-and-forget; pass `context.waitUntil` on Workers.
+ * - {@link fireAsync} awaits full enqueue (including journal in durable mode) and may reject.
  * - Logs accepted before {@link ready} sit in a **volatile** pre-ready buffer; durable
- *   WAL/DLQ paths apply only after bootstrap when the buffer is flushed.
+ *   journal/DLQ paths apply only after bootstrap when the buffer is flushed.
+ * - Volatile request runtimes: use `fireAsync()` + `flush()` for delivery guarantees.
+ *   Detached `fire()` alone is not durable across isolate exit.
  */
 export class AuditLogger<TActions extends string = string> {
   private engine: BootstrapResult | null = null;
@@ -84,6 +89,8 @@ export class AuditLogger<TActions extends string = string> {
   private integrityTip = INTEGRITY_GENESIS;
   /** Serializes integrity sealing so concurrent fire() keeps a total order. */
   private integrityChain: Promise<void> = Promise.resolve();
+  /** Single-flight {@link runMaintenance}. */
+  private maintenancePromise: Promise<void> | null = null;
 
   /**
    * Promise that resolves when bootstrap is complete.
@@ -94,9 +101,26 @@ export class AuditLogger<TActions extends string = string> {
   constructor(config: LogbunConfig<TActions>) {
     this.config = config;
 
+    const mode = config.mode ?? 'volatile';
+    // Durable requires a persistent reliability adapter (synchronous reject).
+    if (mode === 'durable') {
+      if (!config.reliability) {
+        throw new Error(
+          'durable mode requires LogbunConfig.reliability with a persistent adapter ' +
+            '(e.g. FileReliabilityAdapter from "logbun/durability/filesystem" or ' +
+            'CloudflareReliabilityAdapter from "logbun/durability/cloudflare")'
+        );
+      }
+      if (!config.reliability.persistent) {
+        throw new Error(
+          'durable mode requires a persistent ReliabilityAdapter ' +
+            '(MemoryReliabilityAdapter is not durable)'
+        );
+      }
+    }
+
     // Back-compat defaults are unsafe for multi-tenant SaaS — emit once for ops.
     // Explicit mode:'volatile' still warns (name keeps "default" for alert continuity).
-    const mode = config.mode ?? 'volatile';
     if (mode === 'volatile') {
       this.emit({ type: 'limit', detail: 'unsafe_default_volatile' });
     }
@@ -164,10 +188,10 @@ export class AuditLogger<TActions extends string = string> {
 
     // Engine still up (including mid-shutdown): batcher owns durable shutdown path.
     if (this.engine) {
-      // Prefer fireAsync when the caller must await WAL / enqueue completion.
-      void this.sealAndEnqueue(log).catch(() => {
+      const task = this.sealAndEnqueue(log).catch(() => {
         /* fire() never throws */
       });
+      this.registerWaitUntil(context, task);
       return;
     }
 
@@ -195,6 +219,14 @@ export class AuditLogger<TActions extends string = string> {
       return;
     }
     this.preReadyBuffer.push(log);
+    // waitUntil covers ready + pre-ready drain (buffer flushed before ready resolves)
+    this.registerWaitUntil(
+      context,
+      this.ready.then(
+        () => undefined,
+        () => undefined
+      )
+    );
   }
 
   /**
@@ -328,24 +360,24 @@ export class AuditLogger<TActions extends string = string> {
       };
     }
 
-    let walApproxBytes = 0;
-    if (this.engine.wal) {
-      try {
-        walApproxBytes = await this.engine.wal.approximateSize();
-      } catch {
-        walApproxBytes = 0;
-      }
+    try {
+      const rs = await this.engine.reliability.getStats();
+      return {
+        ...base,
+        walApproxBytes: rs.journalApproxBytes,
+        dlqPending: rs.dlqPending,
+        dlqProcessing: rs.dlqProcessing,
+        dlqDead: rs.dlqDead,
+      };
+    } catch {
+      return {
+        ...base,
+        walApproxBytes: 0,
+        dlqPending: 0,
+        dlqProcessing: 0,
+        dlqDead: 0,
+      };
     }
-
-    const dlqCounts = await this.readDlqCounts();
-
-    return {
-      ...base,
-      walApproxBytes,
-      dlqPending: dlqCounts.pending,
-      dlqProcessing: dlqCounts.processing,
-      dlqDead: dlqCounts.dead,
-    };
   }
 
   async query(opts: {
@@ -411,45 +443,111 @@ export class AuditLogger<TActions extends string = string> {
   }
 
   /**
-   * List DLQ files (ops / admin). Includes pending by default; pass flags for dead.
+   * List DLQ entries (ops / admin). Includes pending by default; pass flags for dead.
+   * Entries use opaque stable ids — pass those to requeueDead / deleteDead.
    */
   async listDlq(opts?: {
     includePending?: boolean;
     includeProcessing?: boolean;
     includeDead?: boolean;
-  }): Promise<DLQFileInfo[]> {
+  }): Promise<DLQEntry[]> {
     await this.ready;
     if (!this.engine || this._degraded) {
       throw new Error('AuditLogger is not initialized');
     }
-    return this.engine.dlq.listAll(opts);
+    return this.engine.reliability.listDlq(opts);
   }
 
-  /** Re-queue a poisoned `.dead` batch for another retry attempt. */
-  async requeueDead(deadPath: string): Promise<string> {
+  /**
+   * Re-queue a poisoned dead batch. Accepts opaque id; preserves id, resets attempts.
+   */
+  async requeueDead(id: string): Promise<string> {
     await this.ready;
     if (!this.engine || this._degraded) {
       throw new Error('AuditLogger is not initialized');
     }
-    return this.engine.dlq.requeueDead(deadPath);
+    return this.engine.reliability.requeueDead(id);
   }
 
-  /** Permanently delete a poisoned `.dead` batch. */
-  async deleteDead(deadPath: string): Promise<void> {
+  /** Permanently delete a poisoned dead batch by opaque id. */
+  async deleteDead(id: string): Promise<void> {
     await this.ready;
     if (!this.engine || this._degraded) {
       throw new Error('AuditLogger is not initialized');
     }
-    await this.engine.dlq.deleteDead(deadPath);
+    await this.engine.reliability.deleteDead(id);
   }
 
-  /** Force an immediate DLQ retry scan (ops). */
+  /**
+   * Force an immediate DLQ retry scan (ops convenience).
+   * Same scan logic as {@link runMaintenance} without flush/retention.
+   */
   async retryDlqNow(): Promise<void> {
     await this.ready;
     if (!this.engine || this._degraded) {
       throw new Error('AuditLogger is not initialized');
     }
     await this.engine.retryEngine.scan();
+  }
+
+  /**
+   * Flush all in-memory queues (and compact journal when durable).
+   * Prefer for request-end volatile delivery: `await fireAsync(...); await flush()`.
+   */
+  async flush(): Promise<void> {
+    await this.ready;
+    if (!this.engine || this._degraded) {
+      throw new Error('AuditLogger is not initialized');
+    }
+    await this.engine.batcher.flushAll();
+  }
+
+  /**
+   * Single-flight maintenance: flush queued work, one DLQ retry scan,
+   * and retention prune when configured. Hosts schedule this (cron, DO alarm).
+   * Concurrent calls share the same in-flight promise.
+   */
+  async runMaintenance(): Promise<void> {
+    if (this.maintenancePromise) return this.maintenancePromise;
+    this.maintenancePromise = this.doMaintenance().finally(() => {
+      this.maintenancePromise = null;
+    });
+    return this.maintenancePromise;
+  }
+
+  private async doMaintenance(): Promise<void> {
+    await this.ready;
+    if (!this.engine || this._degraded) {
+      throw new Error('AuditLogger is not initialized');
+    }
+    try {
+      await this.engine.batcher.flushAll();
+    } catch (err) {
+      this.emit({
+        type: 'flush_fail',
+        error: err instanceof Error ? err.message : String(err),
+        detail: 'maintenance_flush',
+      });
+    }
+    try {
+      await this.engine.retryEngine.scan();
+    } catch (err) {
+      this.emit({
+        type: 'flush_fail',
+        error: err instanceof Error ? err.message : String(err),
+        detail: 'maintenance_dlq_scan',
+      });
+    }
+    if (this.config.retention) {
+      await runRetentionPrune({
+        tenancyMode: this.config.tenancy?.mode,
+        knownTenantIds: this.config.tenancy?.knownTenantIds,
+        pool: this.engine.pool,
+        baseAdapter: this.config.adapter,
+        retentionDays: this.config.retention.days,
+        onEvent: this.config.onEvent,
+      });
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -492,16 +590,8 @@ export class AuditLogger<TActions extends string = string> {
       }
 
       this.engine.retryEngine.stop();
-      if (this.engine.retentionCron) {
-        this.engine.retentionCron.stop();
-      }
-      if (this.engine.wal) {
-        await this.engine.wal.close();
-      }
       await this.engine.pool.closeAll();
-      if (this.engine.instanceLock) {
-        await this.engine.instanceLock.release();
-      }
+      await this.engine.reliability.close();
       this.engine = null;
     }
   }
@@ -566,7 +656,7 @@ export class AuditLogger<TActions extends string = string> {
     const log: LogbunLog<TActions> = {
       ...input,
       action,
-      id: Bun.randomUUIDv7(),
+      id: randomUUIDv7(),
       createdAt: new Date().toISOString(),
       ipAddress: context?.ipAddress,
       userAgent: context?.userAgent,
@@ -583,70 +673,23 @@ export class AuditLogger<TActions extends string = string> {
   }
 
   /**
-   * Best-effort DLQ file counts. Prefers `countFiles` / `countByKind` (one readdir);
-   * falls back to listPending / listProcessing / listDead lengths.
+   * Register admission task with host waitUntil if provided.
+   * Host errors never break the audit pipeline; fire() still never throws.
    */
-  private async readDlqCounts(): Promise<{
-    pending: number;
-    processing: number;
-    dead: number;
-  }> {
-    if (!this.engine) {
-      return { pending: 0, processing: 0, dead: 0 };
-    }
-
-    const dlq = this.engine.dlq as {
-      countFiles?: () => Promise<
-        | { pending: number; processing: number; dead: number }
-        | { pending?: number; processing?: number; dead?: number }
-        | [number, number, number]
-      >;
-      countByKind?: () => Promise<{
-        pending?: number;
-        processing?: number;
-        dead?: number;
-      }>;
-      listPending: () => Promise<string[]>;
-      listProcessing: () => Promise<string[]>;
-      listDead: () => Promise<string[]>;
-    };
-
+  private registerWaitUntil(
+    context: LogbunRequestContext | undefined,
+    task: Promise<unknown>
+  ): void {
+    const waitUntil = context?.waitUntil;
+    if (typeof waitUntil !== 'function') return;
     try {
-      const counter =
-        typeof dlq.countFiles === 'function'
-          ? dlq.countFiles.bind(dlq)
-          : typeof dlq.countByKind === 'function'
-            ? dlq.countByKind.bind(dlq)
-            : null;
-
-      if (counter) {
-        const result = await counter();
-        if (Array.isArray(result)) {
-          return {
-            pending: result[0] ?? 0,
-            processing: result[1] ?? 0,
-            dead: result[2] ?? 0,
-          };
-        }
-        return {
-          pending: result.pending ?? 0,
-          processing: result.processing ?? 0,
-          dead: result.dead ?? 0,
-        };
-      }
-
-      const [pending, processing, dead] = await Promise.all([
-        dlq.listPending(),
-        dlq.listProcessing(),
-        dlq.listDead(),
-      ]);
-      return {
-        pending: pending.length,
-        processing: processing.length,
-        dead: dead.length,
-      };
+      waitUntil(
+        Promise.resolve(task).catch(() => {
+          /* never reject into host */
+        })
+      );
     } catch {
-      return { pending: 0, processing: 0, dead: 0 };
+      /* waitUntil must not break fire() */
     }
   }
 

@@ -1,10 +1,11 @@
+import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AuditLogger } from '../src/logger';
-import { BunSQLiteAdapter } from '../src/adapters/sqlite';
+import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
 import { INTEGRITY_GENESIS } from '../src/utils/crypto';
 
 const cleanupPaths: string[] = [];
@@ -21,13 +22,10 @@ test('integrityChain seals logs and verifyIntegrity detects tamper', async () =>
 
   const audit = new AuditLogger({
     namespace: 'int2',
+    reliability: makeFileReliability('int2', dataDir),
     mode: 'durable',
-    dataDir,
     adapter: new BunSQLiteAdapter({ path: join(dataDir, 'audit.db') }),
     integrityChain: true,
-    instanceLock: true,
-    wal: { fsync: false },
-    dlqFsync: false,
     batching: { maxSize: 1, flushInterval: 50, maxQueueSize: 100, onQueueFull: 'dlq' },
   });
   await audit.ready;

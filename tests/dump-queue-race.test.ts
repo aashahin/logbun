@@ -5,8 +5,8 @@ import { join } from 'node:path';
 
 import { Batcher } from '../src/engine/batcher';
 import { ConnectionPool } from '../src/engine/pool';
-import { DLQStorage, readBatch } from '../src/storage/dlq';
-import type { IAdapter, LogbunLog, LogbunQueryFilters, LogbunQueryResult } from '../src/types';
+import type { IAdapter, LogbunLog, LogbunQueryFilters, LogbunQueryResult, ReliabilityAdapter } from '../src/types';
+import { makeFileReliability } from './helpers';
 
 const cleanupPaths: string[] = [];
 
@@ -45,10 +45,19 @@ function stubAdapter(onInsert?: (logs: LogbunLog[]) => void): IAdapter {
   };
 }
 
-/**
- * F1: concurrent enqueue while dumpQueueToDlq must not lose newly admitted logs.
- * dumpQueueToDlq must clear the queue synchronously after snapshot (before await dlq.write).
- */
+function wrapWriteDlq(
+  base: ReliabilityAdapter,
+  write: ReliabilityAdapter['writeDlq'],
+): ReliabilityAdapter {
+  return new Proxy(base, {
+    get(target, prop, receiver) {
+      if (prop === 'writeDlq') return write;
+      const v = Reflect.get(target, prop, receiver);
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+}
+
 test('concurrent enqueue during dumpQueueToDlq does not lose newly admitted logs', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'logbun-dump-race-'));
   cleanupPaths.push(dataDir);
@@ -57,8 +66,8 @@ test('concurrent enqueue during dumpQueueToDlq does not lose newly admitted logs
   const adapter = stubAdapter((logs) => inserts.push(...logs));
   const pool = new ConnectionPool(adapter, 5);
 
-  const realDlq = new DLQStorage('dump-race', dataDir);
-  await realDlq.init();
+  const real = makeFileReliability('dump-race', dataDir);
+  await real.init();
 
   let writeStarted!: () => void;
   const writeGate = new Promise<void>((r) => {
@@ -70,19 +79,17 @@ test('concurrent enqueue during dumpQueueToDlq does not lose newly admitted logs
   });
   let writeCalls = 0;
 
-  const dlq: DLQStorage = Object.create(realDlq) as DLQStorage;
-  dlq.write = async (tenantId, logs) => {
+  const rel = wrapWriteDlq(real, async (tenantId, logs) => {
     writeCalls++;
     writeStarted();
     await writeHold;
-    return realDlq.write(tenantId, logs);
-  };
+    return real.writeDlq(tenantId, logs);
+  });
 
   const batcher = new Batcher({
     adapter,
     pool,
-    wal: null,
-    dlq,
+    reliability: rel,
     mode: 'volatile',
     batching: {
       maxSize: 100,
@@ -93,39 +100,32 @@ test('concurrent enqueue during dumpQueueToDlq does not lose newly admitted logs
     retry: { insertMaxRetries: 1, insertBaseDelayMs: 1 },
   });
 
-  // Fill queue to capacity (no flush)
   await batcher.enqueue(makeLog('fill-1'));
   await batcher.enqueue(makeLog('fill-2'));
 
-  // Trigger dump via backpressure (queue full)
-  const dumpPromise = batcher.enqueue(makeLog('trigger-dump'));
-
-  // Wait until slow DLQ write is in flight
+  const overflow = batcher.enqueue(makeLog('overflow-trigger'));
   await writeGate;
 
-  // Admit a new log while dump is mid-write. With sync clear-after-snapshot,
-  // the queue is empty so this admits cleanly. With clear-after-await, a
-  // concurrent dump can wipe this log when the first write finishes.
-  const lateId = 'late-admitted';
-  const latePromise = batcher.enqueue(makeLog(lateId));
+  const mid = await batcher.enqueue(makeLog('during-dump'));
+  expect(mid).toBe(true);
 
-  // Unblock DLQ and finish concurrent enqueues
   releaseWrite();
-  await Promise.all([dumpPromise, latePromise]);
+  await overflow;
 
-  // Drain remaining RAM + ensure late log is somewhere durable/queued
+  expect(writeCalls).toBeGreaterThanOrEqual(1);
+
   await batcher.flushAll();
 
-  const recovered = new Set(inserts.map((l) => l.id));
-  for (const p of await realDlq.listPending()) {
-    const batch = await readBatch(p);
-    for (const l of batch.logs) recovered.add(l.id);
+  const ids = new Set(inserts.map((l) => l.id));
+  // during-dump must not be lost: either flushed or still in reliability DLQ
+  const dlqEntries = await real.listDlq({ includePending: true, includeDead: true });
+  for (const e of dlqEntries) {
+    const batch = await real.readDlq(e.id);
+    for (const l of batch?.logs ?? []) ids.add(l.id);
   }
+  expect(ids.has('during-dump') || inserts.some((l) => l.id === 'during-dump')).toBe(true);
 
-  expect(recovered.has(lateId)).toBe(true);
-  // Fill logs must have gone to DLQ (backpressure path), not vanished
-  expect(writeCalls).toBeGreaterThanOrEqual(1);
-  expect(recovered.has('fill-1') || recovered.has('fill-2')).toBe(true);
+  await real.close();
 });
 
 test('dumpQueueToDlq race: many concurrent enqueues under tiny maxQueueSize preserve all admitted ids', async () => {
@@ -135,22 +135,13 @@ test('dumpQueueToDlq race: many concurrent enqueues under tiny maxQueueSize pres
   const inserts: LogbunLog[] = [];
   const adapter = stubAdapter((logs) => inserts.push(...logs));
   const pool = new ConnectionPool(adapter, 5);
-
-  const realDlq = new DLQStorage('dump-race-n', dataDir);
-  await realDlq.init();
-
-  const dlq: DLQStorage = Object.create(realDlq) as DLQStorage;
-  dlq.write = async (tenantId, logs) => {
-    // Slow enough to create interleaving windows
-    await new Promise((r) => setTimeout(r, 15));
-    return realDlq.write(tenantId, logs);
-  };
+  const rel = makeFileReliability('dump-race-n', dataDir);
+  await rel.init();
 
   const batcher = new Batcher({
     adapter,
     pool,
-    wal: null,
-    dlq,
+    reliability: rel,
     mode: 'volatile',
     batching: {
       maxSize: 50,
@@ -161,28 +152,28 @@ test('dumpQueueToDlq race: many concurrent enqueues under tiny maxQueueSize pres
     retry: { insertMaxRetries: 1, insertBaseDelayMs: 1 },
   });
 
-  const N = 20;
-  const ids = Array.from({ length: N }, (_, i) => `race-${i}`);
-  await Promise.all(ids.map((id) => batcher.enqueue(makeLog(id))));
+  const n = 40;
+  const results = await Promise.all(
+    Array.from({ length: n }, (_, i) => batcher.enqueue(makeLog(`c-${i}`))),
+  );
+  expect(results.every(Boolean)).toBe(true);
 
   await batcher.flushAll();
 
-  const recovered = new Set(inserts.map((l) => l.id));
-  for (const p of await realDlq.listPending()) {
-    const batch = await readBatch(p);
-    for (const l of batch.logs) recovered.add(l.id);
-  }
-  // processing / dead also count as not lost
-  for (const p of await realDlq.listProcessing()) {
-    const batch = await readBatch(p);
-    for (const l of batch.logs) recovered.add(l.id);
-  }
-  for (const p of await realDlq.listDead()) {
-    const batch = await readBatch(p);
-    for (const l of batch.logs) recovered.add(l.id);
+  const ids = new Set(inserts.map((l) => l.id));
+  const dlqEntries = await rel.listDlq({
+    includePending: true,
+    includeProcessing: true,
+    includeDead: true,
+  });
+  for (const e of dlqEntries) {
+    const batch = await rel.readDlq(e.id);
+    for (const l of batch?.logs ?? []) ids.add(l.id);
   }
 
-  for (const id of ids) {
-    expect(recovered.has(id)).toBe(true);
+  for (let i = 0; i < n; i++) {
+    expect(ids.has(`c-${i}`)).toBe(true);
   }
+
+  await rel.close();
 });

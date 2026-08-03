@@ -1,0 +1,36 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": [],
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "strict": true,
+    "noEmit": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "allowImportingTsExtensions": false
+  },
+  "include": [
+    "src/index.ts",
+    "src/logger.ts",
+    "src/bootstrap.ts",
+    "src/types.ts",
+    "src/events.ts",
+    "src/engine/**/*.ts",
+    "src/reliability/**/*.ts",
+    "src/utils/**/*.ts",
+    "src/plugins/**/*.ts"
+  ],
+  "exclude": [
+    "src/durability/**",
+    "src/adapters/**",
+    "src/storage/**",
+    "dist",
+    "node_modules"
+  ]
+}

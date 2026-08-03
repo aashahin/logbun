@@ -4,7 +4,7 @@
 import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 
-import { BunSQLiteAdapter } from '../src/adapters/sqlite';
+import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
 import { AuditLogger, ENTERPRISE_DEFAULTS } from '../src/index';
 import {
   installTestCleanup,
@@ -12,6 +12,7 @@ import {
   FAST_BATCH,
   FAST_RETRY,
   waitFor,
+  makeFileReliability,
 } from './helpers';
 
 type Actions = 'resource.created' | 'resource.deleted' | 'resource.read';
@@ -24,9 +25,8 @@ describe('e2e multi-tenant', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-mt',
-      dataDir,
+      reliability: makeFileReliability('e2e-mt', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'shared.db') }),
-      wal: { fsync: false },
       batching: { maxSize: 10, flushInterval: 30, maxQueueSize: 500 },
       retry: FAST_RETRY,
     });
@@ -80,9 +80,8 @@ describe('e2e multi-tenant', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-conc',
-      dataDir,
+      reliability: makeFileReliability('e2e-conc', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'c.db') }),
-      wal: { fsync: false },
       batching: { maxSize: 25, flushInterval: 40, maxQueueSize: 5_000 },
       maxFlushConcurrency: 8,
       retry: FAST_RETRY,
@@ -152,7 +151,7 @@ describe('e2e multi-tenant', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-dpt',
-      dataDir,
+      reliability: makeFileReliability('e2e-dpt', dataDir),
       // Base adapter unused for tenant writes when DPT resolves
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'base.db') }),
       tenancy: {
@@ -165,7 +164,6 @@ describe('e2e multi-tenant', () => {
       },
       adapterFactory: async (config) =>
         new BunSQLiteAdapter({ path: String(config['path']) }),
-      wal: { fsync: false },
       batching: { maxSize: 5, flushInterval: 25, maxQueueSize: 200 },
       retry: FAST_RETRY,
     });
@@ -238,9 +236,8 @@ describe('e2e multi-tenant', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-reqt',
-      dataDir,
+      reliability: makeFileReliability('e2e-reqt', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-      wal: { fsync: false },
       batching: FAST_BATCH,
       retry: FAST_RETRY,
       onEvent,
@@ -267,9 +264,8 @@ describe('e2e multi-tenant', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-mix',
-      dataDir,
+      reliability: makeFileReliability('e2e-mix', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'mix.db') }),
-      wal: { fsync: false },
       batching: { maxSize: 15, flushInterval: 25, maxQueueSize: 2_000 },
       maxFlushConcurrency: 4,
       retry: FAST_RETRY,

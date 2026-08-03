@@ -1,9 +1,10 @@
+import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { BunSQLiteAdapter } from '../src/adapters/sqlite';
+import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
 import { AuditLogger } from '../src/logger';
 import type { LogbunLog } from '../src/types';
 
@@ -41,7 +42,6 @@ test('redactPaths removes password inside array of objects in newValues', async 
     namespace: 'redact-arr',
     mode: 'volatile',
     adapter: new BunSQLiteAdapter({ path: dbPath }),
-    dataDir,
     redactPaths: ['password'],
     batching: { maxSize: 1, flushInterval: 20 },
   });
@@ -96,7 +96,6 @@ test('redactPaths removes password in nested array under metadata', async () => 
     namespace: 'redact-meta',
     mode: 'volatile',
     adapter: new BunSQLiteAdapter({ path: dbPath }),
-    dataDir,
     redactPaths: ['password'],
     batching: { maxSize: 1, flushInterval: 20 },
   });
@@ -143,7 +142,6 @@ test('redactPaths still redacts top-level bag password object key', async () => 
     namespace: 'redact-obj',
     mode: 'volatile',
     adapter: new BunSQLiteAdapter({ path: dbPath }),
-    dataDir,
     redactPaths: ['password'],
     batching: { maxSize: 1, flushInterval: 20 },
   });

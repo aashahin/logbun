@@ -6,23 +6,23 @@ import { describe, expect, test } from 'bun:test';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { BunSQLiteAdapter } from '../src/adapters/sqlite';
+import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
 import {
-  installTestCleanup,
   AuditLogger,
   ENTERPRISE_DEFAULTS,
   INTEGRITY_GENESIS,
   normalizeEncryptionKey,
-  resolveLogbunDir,
   sanitizeNamespace,
   sanitizeTenantKey,
 } from '../src/index';
+import { resolveLogbunDir } from '../src/durability/filesystem';
 import {
   installTestCleanup,
   eventCollector,
   FAST_BATCH,
   FAST_RETRY,
   waitFor,
+  makeFileReliability,
 } from './helpers';
 
 type Actions = 'profile.updated' | 'secret.rotated' | 'doc.saved';
@@ -36,9 +36,8 @@ describe('e2e safety controls', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-payload',
-      dataDir,
+      reliability: makeFileReliability('e2e-payload', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-      wal: { fsync: false },
       maxPayloadBytes: 120,
       batching: { maxSize: 1, flushInterval: 20 },
       retry: FAST_RETRY,
@@ -91,9 +90,8 @@ describe('e2e safety controls', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-strcap',
-      dataDir,
+      reliability: makeFileReliability('e2e-strcap', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-      wal: { fsync: false },
       maxStringFieldBytes: 32,
       batching: { maxSize: 1, flushInterval: 20 },
       retry: FAST_RETRY,
@@ -140,9 +138,8 @@ describe('e2e safety controls', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-redact',
-      dataDir,
+      reliability: makeFileReliability('e2e-redact', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-      wal: { fsync: false },
       redactPaths: [
         'password',
         'ssn',
@@ -217,9 +214,8 @@ describe('e2e safety controls', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-integ',
-      dataDir,
+      reliability: makeFileReliability('e2e-integ', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-      wal: { fsync: false },
       integrityChain: true,
       batching: { maxSize: 10, flushInterval: 30, maxQueueSize: 50 },
       retry: FAST_RETRY,
@@ -283,10 +279,8 @@ describe('e2e safety controls', () => {
     const a1 = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-enc',
-      dataDir,
+      reliability: makeFileReliability('e2e-enc', dataDir, { encryptionKey: passphrase }),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-      encryptionKey: passphrase,
-      wal: { fsync: false },
       // Keep unflushed so WAL has content
       batching: {
         maxSize: 10_000,
@@ -340,9 +334,9 @@ describe('e2e safety controls', () => {
     const a2 = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-enc-2',
+      reliability: makeFileReliability('e2e-enc-2', dataDir, { encryptionKey: passphrase }),
       dataDir: join(dataDir, 'n2'),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-      encryptionKey: passphrase,
       mode: 'volatile',
       requireTenantId: true,
       batching: FAST_BATCH,
@@ -366,14 +360,15 @@ describe('e2e safety controls', () => {
 
   test('integrity + encryption together still round-trips', async () => {
     const dataDir = await tempDataDir('logbun-e2e-both-');
+    const passphrase = 'e2e-both-passphrase';
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-both',
-      dataDir,
+      reliability: makeFileReliability('e2e-both', dataDir, {
+        encryptionKey: passphrase,
+      }),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-      encryptionKey: 'combo-key-for-tests-only',
       integrityChain: true,
-      wal: { fsync: false },
       batching: { maxSize: 3, flushInterval: 25 },
       retry: FAST_RETRY,
     });
@@ -425,9 +420,8 @@ describe('e2e safety controls', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-qlim',
-      dataDir,
+      reliability: makeFileReliability('e2e-qlim', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-      wal: { fsync: false },
       maxQueryLimit: 5,
       batching: { maxSize: 50, flushInterval: 30 },
       retry: FAST_RETRY,
@@ -479,7 +473,6 @@ describe('e2e safety controls', () => {
       namespace: 'e2e-vol',
       mode: 'volatile',
       requireTenantId: true,
-      dataDir,
       adapter,
       // Never auto-flush
       batching: {

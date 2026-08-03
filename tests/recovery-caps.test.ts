@@ -1,3 +1,4 @@
+import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -5,7 +6,7 @@ import { join } from 'node:path';
 
 import { Batcher } from '../src/engine/batcher';
 import { ConnectionPool } from '../src/engine/pool';
-import { DLQStorage } from '../src/storage/dlq';
+import { DLQStorage } from '../src/durability/filesystem';
 import type {
   IAdapter,
   LogbunLog,
@@ -61,12 +62,15 @@ test('injectRecovered respects maxActiveTenants=1 and retains rest in recoveryBa
   const pool = new ConnectionPool(adapter, 5);
   const dlq = new DLQStorage('recovery-caps', dataDir);
   await dlq.init();
+  const rel = makeFileReliability('rel-ns', dataDir);
+  await rel.init();
+  // use underlying if needed — prefer FileReliabilityAdapter alone
+
 
   const batcher = new Batcher({
     adapter,
     pool,
-    wal: null,
-    dlq,
+    reliability: rel,
     mode: 'volatile',
     maxActiveTenants: 1,
     // Large enough that all tenants fit in the first wave size-wise;
@@ -108,11 +112,12 @@ test('injectRecovered never grows queues beyond maxActiveTenants and backlogs ov
   await dlq.init();
 
   const maxActive = 2;
+    const rel = makeFileReliability('recovery-caps-2', dataDir);
+    await rel.init();
   const batcher = new Batcher({
     adapter,
     pool,
-    wal: null,
-    dlq,
+    reliability: rel,
     mode: 'volatile',
     maxActiveTenants: maxActive,
     maxRecoveryBatch: 1_000,
@@ -156,11 +161,12 @@ test('injectRecovered respects maxQueueSize per tenant and backlogs overflow', a
 
   const maxQueueSize = 5;
   const recoveredCount = 20;
+    const rel = makeFileReliability('recovery-maxq', dataDir);
+    await rel.init();
   const batcher = new Batcher({
     adapter,
     pool,
-    wal: null,
-    dlq,
+    reliability: rel,
     mode: 'volatile',
     // Large wave so all logs hit injectWave in one shot
     maxRecoveryBatch: 1_000,

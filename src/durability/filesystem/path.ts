@@ -1,20 +1,13 @@
-import { join } from 'node:path';
-
-const NAMESPACE_RE = /^[a-zA-Z0-9_-]{1,64}$/;
-
 /**
- * Validate and return a storage namespace.
- * Only alphanumeric, underscore, and hyphen; 1–64 characters.
- * @throws Error if empty or invalid
+ * Filesystem path helpers for FileReliabilityAdapter.
+ * Requires node:path (Node / Bun / Deno node:compat).
+ *
+ * Deno: grant `--allow-read` and `--allow-write` for the data directory.
  */
-export function sanitizeNamespace(ns: string): string {
-  if (typeof ns !== 'string' || !ns || !NAMESPACE_RE.test(ns)) {
-    throw new Error(
-      `Invalid namespace ${JSON.stringify(ns)}: must match /^[a-zA-Z0-9_-]{1,64}$/`
-    );
-  }
-  return ns;
-}
+import { join } from 'node:path';
+import { sanitizeNamespace } from '../../utils/namespace';
+
+export { sanitizeNamespace };
 
 /**
  * Resolve the Logbun data directory root for a namespace.
@@ -27,7 +20,6 @@ export function resolveLogbunDir(namespace: string, dataDir?: string): string {
   const root = dataDir ?? '.logbun';
 
   if (dataDir != null) {
-    // Reject path-traversal segments in dataDir (absolute paths are fine)
     const normalized = dataDir.replace(/\\/g, '/');
     const parts = normalized.split('/').filter((p) => p.length > 0);
     if (parts.includes('..')) {

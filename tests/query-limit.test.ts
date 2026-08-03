@@ -1,9 +1,10 @@
+import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { BunSQLiteAdapter } from '../src/adapters/sqlite';
+import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
 import { AuditLogger } from '../src/logger';
 import type { IAdapter, LogbunLog, LogbunQueryFilters, LogbunQueryResult } from '../src/types';
 
@@ -44,7 +45,6 @@ test('maxQueryLimit clamps pagination limit via AuditLogger', async () => {
     namespace: 'query-limit-ns',
     mode: 'volatile',
     adapter,
-    dataDir: dir,
     maxQueryLimit,
   });
 
@@ -94,7 +94,6 @@ test('default maxQueryLimit of 500 is passed to adapter.query', async () => {
     namespace: 'query-default-ns',
     mode: 'volatile',
     adapter,
-    dataDir: dir,
   });
 
   await audit.ready;

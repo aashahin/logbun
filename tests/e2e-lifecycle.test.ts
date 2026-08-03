@@ -4,7 +4,7 @@
 import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 
-import { BunSQLiteAdapter } from '../src/adapters/sqlite';
+import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
 import { AuditLogger, ENTERPRISE_DEFAULTS } from '../src/index';
 import {
   installTestCleanup,
@@ -13,6 +13,7 @@ import {
   FAST_RETRY,
   sleep,
   waitFor,
+  makeFileReliability,
 } from './helpers';
 
 type Actions =
@@ -32,10 +33,8 @@ describe('e2e durable lifecycle', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-life',
-      dataDir,
+      reliability: makeFileReliability('e2e-life', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'audit.db') }),
-      wal: { fsync: false },
-      dlqFsync: false,
       batching: { ...FAST_BATCH, maxSize: 5, flushInterval: 30 },
       retry: FAST_RETRY,
       onEvent,
@@ -151,9 +150,8 @@ describe('e2e durable lifecycle', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-page',
-      dataDir,
+      reliability: makeFileReliability('e2e-page', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'audit.db') }),
-      wal: { fsync: false },
       batching: { maxSize: 20, flushInterval: 20, maxQueueSize: 200 },
       retry: FAST_RETRY,
     });
@@ -176,13 +174,13 @@ describe('e2e durable lifecycle', () => {
     const audit2 = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-page-q',
+      reliability: makeFileReliability('e2e-page-q', dataDir),
       dataDir: join(dataDir, 'q'),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'audit.db') }),
       mode: 'volatile',
       requireTenantId: true,
       batching: FAST_BATCH,
       retry: FAST_RETRY,
-      instanceLock: false,
     });
     await audit2.ready;
 
@@ -214,9 +212,8 @@ describe('e2e durable lifecycle', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-shut',
-      dataDir,
+      reliability: makeFileReliability('e2e-shut', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'audit.db') }),
-      wal: { fsync: false },
       // Large batch so timer alone would not flush
       batching: { maxSize: 10_000, flushInterval: 60_000, maxQueueSize: 10_000 },
       retry: FAST_RETRY,
@@ -259,55 +256,7 @@ describe('e2e durable lifecycle', () => {
     const dataDir = await tempDataDir('logbun-e2e-crash-');
     const dbPath = join(dataDir, 'audit.db');
 
-    // Instance 1: durable enqueue but never flush (huge interval/size)
-    const a1 = new AuditLogger<Actions>({
-      ...ENTERPRISE_DEFAULTS,
-      namespace: 'e2e-crash',
-      dataDir,
-      adapter: new BunSQLiteAdapter({ path: dbPath }),
-      wal: { fsync: false },
-      batching: {
-        maxSize: 10_000,
-        flushInterval: 60_000,
-        maxQueueSize: 10_000,
-      },
-      retry: FAST_RETRY,
-      // Allow second instance on same ns after release
-      instanceLock: true,
-    });
-    await a1.ready;
-
-    const actions: Array<{ entityId: string; action: Actions }> = [
-      { entityId: 'e1', action: 'course.created' },
-      { entityId: 'e2', action: 'course.deleted' },
-      { entityId: 'e3', action: 'billing.charged' },
-    ];
-    for (const a of actions) {
-      await a1.fireAsync(a.action, {
-        tenantId: 't-crash',
-        actorId: 'user_x',
-        entityId: a.entityId,
-      });
-    }
-
-    // Simulate hard kill: close WAL without flushAll (release lock via shutdown
-    // would flush — so close engine pieces carefully). Use shutdown then wipe
-    // is wrong. Instead: leave logs only in WAL by not calling flush, then
-    // release lock by shutdown which DOES flush. To simulate crash we need to
-    // not flush — release instance lock by deleting/killing without flush.
-    //
-    // Approach: write with durable WAL, then process.exit simulation =
-    // close wal handle without acknowledge, then start new logger.
-    // AuditLogger.shutdown always flushes. So seed WAL by not flushing:
-    // we force-kill by setting engine null after closing lock manually is hard.
-    //
-    // Better approach matching existing recovery test: shutdown instance after
-    // failing adapter so WAL keeps unacked, OR use instance 1 with failing
-    // adapter so flush goes to DLQ/WAL, then restart with good adapter.
-    await a1.shutdown(); // this flushes to sqlite successfully
-
-    // Re-seed: second phase with failing adapter so WAL retains unacked
-    const dataDir2 = await tempDataDir('logbun-e2e-crash2-');
+    // Instance 1: durable enqueue with failing destination so journal stays unacked
     const failAdapter: import('../src/types').IAdapter = {
       async init() {},
       async bulkInsert() {
@@ -323,77 +272,64 @@ describe('e2e durable lifecycle', () => {
     const aFail = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-crash-wal',
-      dataDir: dataDir2,
+      reliability: makeFileReliability('e2e-crash-wal', dataDir),
       adapter: failAdapter,
-      wal: { fsync: false },
       batching: {
-        maxSize: 100,
-        flushInterval: 60_000,
+        maxSize: 1,
+        flushInterval: 20,
         maxQueueSize: 100,
         onQueueFull: 'dlq',
       },
-      retry: {
-        insertMaxRetries: 1,
-        insertBaseDelayMs: 1,
-        initialDelayMs: 60_000,
-        maxScanAttempts: 2,
-      },
+      retry: { ...FAST_RETRY, maxScanAttempts: 1 },
     });
     await aFail.ready;
 
-    await aFail.fireAsync('course.created', {
-      tenantId: 't-crash',
-      actorId: 'user_x',
-      entityId: 'recover-me-1',
-    });
-    await aFail.fireAsync('course.deleted', {
-      tenantId: 't-crash',
-      actorId: 'user_x',
-      entityId: 'recover-me-2',
-    });
+    for (const entityId of ['e1', 'e2', 'e3']) {
+      await aFail.fireAsync('course.created', {
+        tenantId: 't-crash',
+        actorId: 'user_x',
+        entityId,
+      });
+    }
 
-    // Force flush attempt → fails → stays in WAL/DLQ
-    // Access via shutdown: flushAll will try insert, fail, DLQ or keep WAL
+    await waitFor(async () => {
+      const s = await aFail.getStatsDetailed();
+      return (s.walApproxBytes ?? 0) > 0 || (s.dlqPending ?? 0) > 0;
+    }, 5_000);
+
+    // Hard close reliability without successful delivery (simulate crash after journal)
     await aFail.shutdown();
 
-    // Restart with healthy SQLite adapter — recovery must inject + persist
-    const recovered: string[] = [];
-    const healthy = new BunSQLiteAdapter({
-      path: join(dataDir2, 'recovered.db'),
-    });
+    // Instance 2: healthy adapter recovers journal / DLQ
     const a2 = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-crash-wal',
-      dataDir: dataDir2,
-      adapter: healthy,
-      wal: { fsync: false },
-      batching: { maxSize: 10, flushInterval: 40, maxQueueSize: 200 },
-      retry: {
-        insertMaxRetries: 2,
-        insertBaseDelayMs: 1,
-        initialDelayMs: 50,
-        scanIntervalMs: 100,
-        maxScanAttempts: 5,
-      },
+      reliability: makeFileReliability('e2e-crash-wal', dataDir),
+      adapter: new BunSQLiteAdapter({ path: dbPath }),
+      batching: { ...FAST_BATCH, maxSize: 5, flushInterval: 30 },
+      retry: FAST_RETRY,
     });
     await a2.ready;
+    expect(a2.degraded).toBe(false);
 
+    await a2.runMaintenance();
     await waitFor(async () => {
-      const page = await a2.query({
+      const q = await a2.query({
         tenantId: 't-crash',
         pagination: { limit: 50 },
       });
-      recovered.length = 0;
-      for (const l of page.logs) {
-        if (l.entityId) recovered.push(l.entityId);
-      }
-      return (
-        recovered.includes('recover-me-1') && recovered.includes('recover-me-2')
-      );
+      return q.logs.length >= 3;
     }, 8_000);
 
-    expect(recovered).toContain('recover-me-1');
-    expect(recovered).toContain('recover-me-2');
+    const q = await a2.query({
+      tenantId: 't-crash',
+      pagination: { limit: 50 },
+    });
+    const entities = new Set(q.logs.map((l) => l.entityId));
+    expect(entities.has('e1')).toBe(true);
+    expect(entities.has('e2')).toBe(true);
+    expect(entities.has('e3')).toBe(true);
+
     await a2.shutdown();
   });
 
@@ -417,7 +353,6 @@ describe('e2e durable lifecycle', () => {
       namespace: 'e2e-preready',
       mode: 'volatile',
       requireTenantId: true,
-      dataDir,
       adapter,
       batching: { maxSize: 5, flushInterval: 30 },
       retry: FAST_RETRY,
@@ -459,9 +394,8 @@ describe('e2e durable lifecycle', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-ctx',
-      dataDir,
+      reliability: makeFileReliability('e2e-ctx', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-      wal: { fsync: false },
       batching: { maxSize: 1, flushInterval: 20 },
       retry: FAST_RETRY,
     });
@@ -500,9 +434,8 @@ describe('e2e durable lifecycle', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-dbl',
-      dataDir,
+      reliability: makeFileReliability('e2e-dbl', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-      wal: { fsync: false },
       batching: FAST_BATCH,
       retry: FAST_RETRY,
       onEvent,

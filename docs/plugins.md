@@ -11,6 +11,10 @@ They expose **both**:
 
 Optional **`getTenantId`** fills `tenantId` when the handler omits it (does not override an explicit `input.tenantId`).
 
+Hono passes an execution context's structural `waitUntil` callback when one is
+available, so Workers can keep the actual `fire()` admission task alive
+without introducing Cloudflare types into the root package.
+
 ## IP trust model
 
 | `trustedProxyCount` | Behavior |
@@ -34,13 +38,15 @@ bun add elysia
 import { Elysia } from 'elysia';
 import { AuditLogger } from 'logbun';
 import { auditPlugin } from 'logbun/plugins/elysia';
-import { BunSQLiteAdapter } from 'logbun/adapters/sqlite';
+import { BunSQLiteAdapter } from 'logbun/adapters/bun-sqlite';
+import { FileReliabilityAdapter } from 'logbun/durability/filesystem';
 
 type Actions = 'course.created' | 'course.deleted';
 
 const audit = new AuditLogger<Actions>({
   namespace: 'api',
   mode: 'durable',
+  reliability: new FileReliabilityAdapter({ namespace: 'api', dataDir: '.logbun' }),
   adapter: new BunSQLiteAdapter(),
   requireTenantId: true,
 });
@@ -94,13 +100,15 @@ import {
   createAuditMiddleware,
   type LogbunHonoVariables,
 } from 'logbun/plugins/hono';
-import { BunSQLiteAdapter } from 'logbun/adapters/sqlite';
+import { BunSQLiteAdapter } from 'logbun/adapters/bun-sqlite';
+import { FileReliabilityAdapter } from 'logbun/durability/filesystem';
 
 type Actions = 'course.created';
 
 const audit = new AuditLogger<Actions>({
   namespace: 'api',
   mode: 'durable',
+  reliability: new FileReliabilityAdapter({ namespace: 'api', dataDir: '.logbun' }),
   adapter: new BunSQLiteAdapter(),
   requireTenantId: true,
 });

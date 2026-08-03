@@ -7,7 +7,7 @@ import {
   DLQStorage,
   parseBatch,
   readBatch,
-} from '../src/storage/dlq';
+} from '../src/durability/filesystem';
 import type { LogbunLog } from '../src/types';
 
 const cleanupPaths: string[] = [];
@@ -28,7 +28,7 @@ function makeLog(id: string, tenantId?: string): LogbunLog {
   };
 }
 
-test('write stores v1 envelope with attempts:0 and logs', async () => {
+test('write stores v2 envelope with attempts:0 and logs', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-env-'));
   cleanupPaths.push(dataDir);
 
@@ -38,7 +38,7 @@ test('write stores v1 envelope with attempts:0 and logs', async () => {
   const logs = [makeLog('e1', 'tenant-1'), makeLog('e2', 'tenant-1')];
   await dlq.write('tenant-1', logs);
 
-  const pending = await dlq.listPending();
+  const pending = await dlq.listPendingPaths();
   expect(pending.length).toBe(1);
 
   const raw = await readFile(pending[0]!, 'utf8');
@@ -46,7 +46,7 @@ test('write stores v1 envelope with attempts:0 and logs', async () => {
 
   // New envelope format (not a bare array)
   expect(Array.isArray(parsed)).toBe(false);
-  expect(parsed['v']).toBe(1);
+  expect(parsed['v']).toBe(2);
   expect(parsed['attempts']).toBe(0);
   expect(parsed['tenantId']).toBe('tenant-1');
   expect(Array.isArray(parsed['logs'])).toBe(true);
@@ -62,7 +62,7 @@ test('parseBatch reads envelope and legacy array formats', async () => {
 
   // Envelope path
   await dlq.write('t-env', [makeLog('env-1', 't-env')]);
-  const pending = await dlq.listPending();
+  const pending = await dlq.listPendingPaths();
   expect(pending.length).toBeGreaterThan(0);
 
   const envelopeContent = await readFile(pending[0]!, 'utf8');
@@ -87,7 +87,7 @@ test('incrementAttempts rewrites envelope and poison path moves to .dead', async
   await dlq.init();
 
   await dlq.write('tenant-p', [makeLog('p1', 'tenant-p')]);
-  const [filePath] = await dlq.listPending();
+  const [filePath] = await dlq.listPendingPaths();
   expect(filePath).toBeDefined();
 
   const processingPath = await dlq.markProcessing(filePath!);
@@ -104,7 +104,7 @@ test('incrementAttempts rewrites envelope and poison path moves to .dead', async
   // Poison path: markPoisoned renames to .dead
   await dlq.markPoisoned(processingPath);
 
-  const pendingAfter = await dlq.listPending();
+  const pendingAfter = await dlq.listPendingPaths();
   expect(pendingAfter).toEqual([]);
 
   // .dead file lives under resolveLogbunDir(namespace, dataDir)/dlq
@@ -121,7 +121,7 @@ test('write with null tenantId uses global key', async () => {
   await dlq.init();
 
   await dlq.write(null, [makeLog('g1')]);
-  const pending = await dlq.listPending();
+  const pending = await dlq.listPendingPaths();
   expect(pending.length).toBe(1);
 
   const content = await readFile(pending[0]!, 'utf8');

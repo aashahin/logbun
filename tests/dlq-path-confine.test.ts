@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { DLQStorage } from '../src/storage/dlq';
+import { DLQStorage } from '../src/durability/filesystem';
 import type { LogbunLog } from '../src/types';
 
 const cleanupPaths: string[] = [];
@@ -116,7 +116,7 @@ test('requeueDead/deleteDead still work for in-dir dead files', async () => {
   await dlq.init();
 
   await dlq.write('t-ok', [makeLog('ok-1', 't-ok')]);
-  const [pending] = await dlq.listPending();
+  const [pending] = await dlq.listPendingPaths();
   const processing = await dlq.markProcessing(pending!);
   await dlq.markPoisoned(processing);
 
@@ -124,15 +124,33 @@ test('requeueDead/deleteDead still work for in-dir dead files', async () => {
   expect(dead).toBeDefined();
 
   const requeued = await dlq.requeueDead(dead!);
-  expect(requeued.startsWith(dlq.directory)).toBe(true);
+  // requeue preserves opaque id (not a path)
+  expect(requeued).toBe(dead);
   expect(await dlq.listDead()).toHaveLength(0);
-  expect(await dlq.listPending()).toHaveLength(1);
+  expect(await dlq.listPendingPaths()).toHaveLength(1);
 
   // Poison again and delete
-  const [p2] = await dlq.listPending();
+  const [p2] = await dlq.listPendingPaths();
   const proc2 = await dlq.markProcessing(p2!);
   await dlq.markPoisoned(proc2);
   const [dead2] = await dlq.listDead();
   await dlq.deleteDead(dead2!);
   expect(await dlq.listDead()).toHaveLength(0);
+});
+
+test('diagnostic DLQ metadata path is not accepted as requeue authority', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-id-only-'));
+  cleanupPaths.push(dataDir);
+  const dlq = new DLQStorage('id-only', dataDir);
+  await dlq.init();
+
+  const id = await dlq.write('tenant', [makeLog('id-only', 'tenant')]);
+  const claimed = await dlq.claim(id);
+  expect(claimed).not.toBeNull();
+  await dlq.markPoisoned(id);
+  const [dead] = await dlq.listAll({ includePending: false, includeDead: true });
+  const diagnosticPath = dead?.metadata?.path;
+  expect(typeof diagnosticPath).toBe('string');
+  await expect(dlq.requeueDead(String(diagnosticPath))).rejects.toThrow(/id/);
+  expect(await dlq.requeueDead(dead!.id)).toBe(id);
 });

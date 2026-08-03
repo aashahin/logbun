@@ -1,10 +1,10 @@
-import type { LogbunLog } from '../types';
-import { resolveLogbunDir } from '../utils/path';
+import type { LogbunLog } from '../../types';
+import { resolveLogbunDir } from './path';
 import {
   decryptUtf8,
   encryptUtf8,
   type EncryptionKeyBytes,
-} from '../utils/crypto';
+} from '../../utils/crypto';
 import {
   appendFile,
   mkdir,
@@ -18,6 +18,23 @@ import {
 import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
+
+import { access, constants as FsConstants } from 'node:fs/promises';
+
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await access(path, FsConstants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readTextFile(path: string): Promise<string> {
+  const { readFile } = await import('node:fs/promises');
+  return readFile(path, 'utf8');
+}
+
 
 /** Soft-size hint (64 MiB). Default maxWalBytes / hard refuse threshold. */
 export const WAL_SIZE_SOFT_LIMIT_BYTES = 64 * 1024 * 1024;
@@ -141,16 +158,14 @@ export class WALStorage {
 
   async init(): Promise<void> {
     await mkdir(this.dir, { recursive: true });
-    const file = Bun.file(this.path);
-    if (!(await file.exists())) {
+    if (!(await fileExists(this.path))) {
       await writeFile(this.path, '');
     }
-    const ackFile = Bun.file(this.ackPath);
-    if (!(await ackFile.exists())) {
+    if (!(await fileExists(this.ackPath))) {
       await writeFile(this.ackPath, '');
     } else {
-      const text = await ackFile.text();
-      this.pendingAckCount = text
+      const ackText = await readTextFile(this.ackPath);
+      this.pendingAckCount = ackText
         .split('\n')
         .filter((l) => l.trim().length > 0).length;
     }
@@ -404,8 +419,7 @@ export class WALStorage {
     filePath: string,
     onLog: (log: LogbunLog) => 'continue' | 'stop' | void
   ): Promise<boolean> {
-    const file = Bun.file(filePath);
-    if (!(await file.exists())) return false;
+    if (!(await fileExists(filePath))) return false;
 
     const stream = createReadStream(filePath, { encoding: 'utf8' });
     const rl = createInterface({ input: stream, crlfDelay: Infinity });
@@ -452,9 +466,8 @@ export class WALStorage {
   }
 
   private async readAckedIdsUnlocked(): Promise<Set<string>> {
-    const file = Bun.file(this.ackPath);
-    if (!(await file.exists())) return new Set();
-    const content = await file.text();
+    if (!(await fileExists(this.ackPath))) return new Set();
+    const content = await readTextFile(this.ackPath);
     if (!content.trim()) return new Set();
     const set = new Set<string>();
     for (const line of content.split('\n')) {

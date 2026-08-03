@@ -1,9 +1,10 @@
+import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { BunSQLiteAdapter } from '../src/adapters/sqlite';
+import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
 import { AuditLogger } from '../src/logger';
 import type { IAdapter, LogbunLog, LogbunQueryFilters, LogbunQueryResult } from '../src/types';
 
@@ -42,7 +43,6 @@ test('query without tenantId throws when requireTenantId is true', async () => {
     namespace: 'tenant-req',
     mode: 'volatile',
     adapter,
-    dataDir: dir,
     requireTenantId: true,
   });
 
@@ -67,7 +67,6 @@ test('database_per_tenant query without tenantId throws', async () => {
     namespace: 'dpt-ns',
     mode: 'volatile',
     adapter: baseAdapter,
-    dataDir: dir,
     tenancy: {
       mode: 'database_per_tenant',
       resolveConnection: async (tenantId: string) => ({
@@ -98,7 +97,6 @@ test('requireTenantId false allows query without tenantId (single_database)', as
     namespace: 'tenant-opt',
     mode: 'volatile',
     adapter,
-    dataDir: dir,
     requireTenantId: false,
   });
 

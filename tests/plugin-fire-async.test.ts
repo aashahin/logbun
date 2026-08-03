@@ -1,3 +1,4 @@
+import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -76,13 +77,11 @@ test('createAuditMiddleware sets auditLog.fire and auditLog.fireAsync', async ()
     namespace: 'plugin-fa',
     mode: 'volatile',
     adapter: stubAdapter(),
-    dataDir,
     batching: { maxSize: 100, flushInterval: 60_000 },
     onEvent: (e) => events.push(e),
     retry: {
       insertMaxRetries: 1,
       insertBaseDelayMs: 1,
-      initialDelayMs: 60_000,
     },
   });
   await audit.ready;
@@ -126,13 +125,11 @@ test('auditLog.fire is never-throws; fireAsync rejects when requireTenantId and 
     namespace: 'plugin-fa-req',
     mode: 'volatile',
     adapter: stubAdapter(),
-    dataDir,
     requireTenantId: true,
     batching: { maxSize: 50, flushInterval: 60_000 },
     retry: {
       insertMaxRetries: 1,
       insertBaseDelayMs: 1,
-      initialDelayMs: 60_000,
     },
   });
   await audit.ready;

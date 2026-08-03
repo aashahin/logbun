@@ -1,3 +1,4 @@
+import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -6,7 +7,7 @@ import { join } from 'node:path';
 import { Batcher } from '../src/engine/batcher';
 import { ConnectionPool } from '../src/engine/pool';
 import { AuditLogger } from '../src/logger';
-import { DLQStorage } from '../src/storage/dlq';
+import { DLQStorage } from '../src/durability/filesystem';
 import type {
   IAdapter,
   LogbunEvent,
@@ -63,12 +64,15 @@ test('maxActiveTenants rejects or drops new tenant keys beyond cap', async () =>
   const pool = new ConnectionPool(adapter, 5);
   const dlq = new DLQStorage('tenant-caps', dataDir);
   await dlq.init();
+  const rel = makeFileReliability(/*ns*/'rel-ns', dataDir);
+  await rel.init();
+  // use underlying if needed — prefer FileReliabilityAdapter alone
+
 
   const batcher = new Batcher({
     adapter,
     pool,
-    wal: null,
-    dlq,
+    reliability: rel,
     mode: 'volatile',
     batching: {
       maxSize: 100,
@@ -109,7 +113,6 @@ test('AuditLogger maxActiveTenants=1 drops second tenant key', async () => {
     namespace: 'caps-one',
     mode: 'volatile',
     adapter: stubAdapter(),
-    dataDir,
     maxActiveTenants: 1,
     batching: { maxSize: 50, flushInterval: 60_000 },
     onEvent: (e) => events.push(e),

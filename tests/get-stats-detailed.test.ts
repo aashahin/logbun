@@ -1,10 +1,11 @@
+import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AuditLogger } from '../src/logger';
-import { DLQStorage } from '../src/storage/dlq';
+import { DLQStorage } from '../src/durability/filesystem';
 import type {
   IAdapter,
   LogbunQueryFilters,
@@ -80,13 +81,10 @@ test('getStats includes inflightFlushes', async () => {
     namespace: 'stats-inflight',
     mode: 'volatile',
     adapter: okAdapter(),
-    dataDir,
     batching: { maxSize: 100, flushInterval: 60_000 },
     retry: {
       insertMaxRetries: 1,
       insertBaseDelayMs: 1,
-      initialDelayMs: 60_000,
-      scanIntervalMs: 60_000,
     },
   });
 
@@ -113,7 +111,6 @@ test('getStatsDetailed fills dlqPending after a DLQ write', async () => {
     namespace: ns,
     mode: 'volatile',
     adapter: failingAdapter(),
-    dataDir,
     // Flush immediately on first log so bulkInsert fail routes to DLQ
     batching: {
       maxSize: 1,
@@ -124,8 +121,6 @@ test('getStatsDetailed fills dlqPending after a DLQ write', async () => {
     retry: {
       insertMaxRetries: 1,
       insertBaseDelayMs: 1,
-      initialDelayMs: 60_000,
-      scanIntervalMs: 60_000,
     },
   });
 
@@ -151,12 +146,10 @@ test('getStatsDetailed fills dlqPending after a DLQ write', async () => {
   // volatile mode: no WAL
   expect(detailed.walApproxBytes).toBe(0);
 
-  // Cross-check with direct DLQ storage under the same namespace/dataDir
-  const dlq = new DLQStorage(ns, dataDir);
-  await dlq.init();
-  const pendingFiles = await dlq.listPending();
-  expect(pendingFiles.length).toBeGreaterThanOrEqual(1);
-  expect(detailed.dlqPending).toBe(pendingFiles.length);
+  // Cross-check with listDlq (volatile uses MemoryReliabilityAdapter — no fs DLQ)
+  const listed = await audit.listDlq({ includePending: true });
+  expect(listed.length).toBeGreaterThanOrEqual(1);
+  expect(detailed.dlqPending).toBe(listed.length);
 
   await audit.shutdown();
 });
@@ -169,13 +162,10 @@ test('getStatsDetailed before any DLQ activity reports zero counts', async () =>
     namespace: 'stats-zero',
     mode: 'volatile',
     adapter: okAdapter(),
-    dataDir,
     batching: { maxSize: 50, flushInterval: 60_000 },
     retry: {
       insertMaxRetries: 1,
       insertBaseDelayMs: 1,
-      initialDelayMs: 60_000,
-      scanIntervalMs: 60_000,
     },
   });
 

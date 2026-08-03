@@ -1,3 +1,4 @@
+import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -5,7 +6,7 @@ import { join } from 'node:path';
 
 import { Batcher } from '../src/engine/batcher';
 import { ConnectionPool } from '../src/engine/pool';
-import { DLQStorage } from '../src/storage/dlq';
+import { DLQStorage } from '../src/durability/filesystem';
 import type {
   IAdapter,
   LogbunLog,
@@ -68,12 +69,15 @@ test('maxFlushConcurrency=1 serializes multi-tenant bulkInsert flushes', async (
   const pool = new ConnectionPool(adapter, 20);
   const dlq = new DLQStorage('flush-conc', dataDir);
   await dlq.init();
+  const rel = makeFileReliability('rel-ns', dataDir);
+  await rel.init();
+  // use underlying if needed — prefer FileReliabilityAdapter alone
+
 
   const batcher = new Batcher({
     adapter,
     pool,
-    wal: null,
-    dlq,
+    reliability: rel,
     mode: 'volatile',
     maxFlushConcurrency: 1,
     batching: {
@@ -131,11 +135,12 @@ test('maxFlushConcurrency default still admits concurrent flushes above 1', asyn
   await dlq.init();
 
   // Explicit high concurrency so multi-tenant flushAll can overlap inserts
+    const rel = makeFileReliability('flush-conc-def', dataDir);
+    await rel.init();
   const batcher = new Batcher({
     adapter,
     pool,
-    wal: null,
-    dlq,
+    reliability: rel,
     mode: 'volatile',
     maxFlushConcurrency: 8,
     batching: {

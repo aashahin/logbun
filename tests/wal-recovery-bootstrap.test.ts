@@ -5,7 +5,8 @@ import { join } from 'node:path';
 
 import { bootstrap } from '../src/bootstrap';
 import type { IAdapter, LogbunLog, LogbunQueryFilters, LogbunQueryResult } from '../src/types';
-import { WALStorage } from '../src/storage/wal';
+import { WALStorage } from '../src/durability/filesystem';
+import { makeFileReliability } from './helpers';
 
 const cleanupPaths: string[] = [];
 
@@ -29,7 +30,7 @@ test('bootstrap durable recovery keeps WAL until flush acknowledges', async () =
   cleanupPaths.push(dataDir);
 
   // Seed WAL as if process crashed mid-flight
-  const seedWal = new WALStorage('boot-ns', dataDir);
+  const seedWal = new WALStorage('boot-ns', dataDir, { fsync: false });
   await seedWal.init();
   await seedWal.append(makeLog('boot-1'));
   await seedWal.append(makeLog('boot-2'));
@@ -53,18 +54,18 @@ test('bootstrap durable recovery keeps WAL until flush acknowledges', async () =
     async close() {},
   };
 
+  const reliability = makeFileReliability('boot-ns', dataDir);
   const engine = await bootstrap({
     namespace: 'boot-ns',
+    reliability,
     mode: 'durable',
-    dataDir,
     adapter,
     batching: { maxSize: 100, flushInterval: 30, maxQueueSize: 1000, onQueueFull: 'dlq' },
   });
 
-  // Immediately after bootstrap, WAL must still contain recovered ids
-  // (truncating here would risk data loss if process dies before flush)
-  const afterBoot = await engine.wal!.readAll();
-  expect(afterBoot.map((l) => l.id).sort()).toEqual(['boot-1', 'boot-2']);
+  // Immediately after bootstrap, journal must still contain recovered ids
+  const afterBoot = await engine.reliability.recoverJournal();
+  expect(afterBoot.logs.map((l) => l.id).sort()).toEqual(['boot-1', 'boot-2']);
 
   // Drain via scheduled recovery flush
   const start = Date.now();
@@ -73,17 +74,13 @@ test('bootstrap durable recovery keeps WAL until flush acknowledges', async () =
   }
   expect(inserts.map((l) => l.id).sort()).toEqual(['boot-1', 'boot-2']);
 
-  // After successful flush + acknowledge, WAL should no longer hold those ids
-  const afterFlush = await engine.wal!.readAll();
-  expect(afterFlush.map((l) => l.id)).not.toContain('boot-1');
-  expect(afterFlush.map((l) => l.id)).not.toContain('boot-2');
+  // After successful flush + acknowledge, journal should no longer hold those ids
+  const afterFlush = await engine.reliability.recoverJournal();
+  expect(afterFlush.logs.map((l) => l.id)).not.toContain('boot-1');
+  expect(afterFlush.logs.map((l) => l.id)).not.toContain('boot-2');
 
   engine.retryEngine.stop();
   await engine.batcher.flushAll();
-  await engine.wal?.close();
   await engine.pool.closeAll();
-  // Release instance lock handle before afterEach deletes dataDir (avoids GC fd errors).
-  if (engine.instanceLock) {
-    await engine.instanceLock.release();
-  }
+  await engine.reliability.close();
 });

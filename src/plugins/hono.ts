@@ -73,12 +73,16 @@ export const createAuditMiddleware = <T extends string>(
   const getTenantId = opts?.getTenantId;
 
   return async (c: Context, next: () => Promise<void>) => {
+    // Structural waitUntil from Workers executionCtx — no cloudflare: types on root.
+    const waitUntil = extractWaitUntil(c);
+
     const requestContext = {
       ipAddress: extractClientIp(
         (name) => c.req.header(name),
         trustedProxyCount
       ),
       userAgent: c.req.header('user-agent') ?? undefined,
+      waitUntil,
     };
 
     const withTenant = (
@@ -99,3 +103,31 @@ export const createAuditMiddleware = <T extends string>(
     await next();
   };
 };
+
+/**
+ * Safely extract ExecutionContext.waitUntil when present (Cloudflare Workers).
+ * Avoids importing cloudflare: types into the root package graph.
+ */
+function extractWaitUntil(
+  c: Context
+): ((task: Promise<unknown>) => void) | undefined {
+  try {
+    const ctx = c as Context & {
+      executionCtx?: { waitUntil?: (p: Promise<unknown>) => void };
+      env?: unknown;
+    };
+    const wu = ctx.executionCtx?.waitUntil;
+    if (typeof wu === 'function') {
+      return (task: Promise<unknown>) => {
+        try {
+          wu.call(ctx.executionCtx, task);
+        } catch {
+          /* host errors never break fire */
+        }
+      };
+    }
+  } catch {
+    /* ignore */
+  }
+  return undefined;
+}

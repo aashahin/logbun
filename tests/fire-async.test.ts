@@ -1,9 +1,10 @@
+import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { BunSQLiteAdapter } from '../src/adapters/sqlite';
+import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
 import { AuditLogger } from '../src/logger';
 import type { IAdapter, LogbunEvent, LogbunQueryFilters, LogbunQueryResult } from '../src/types';
 
@@ -46,7 +47,6 @@ test('fireAsync awaits enqueue and getStats returns shape', async () => {
     namespace: 'fire-async',
     mode: 'volatile',
     adapter: stubAdapter(),
-    dataDir,
     batching: { maxSize: 100, flushInterval: 60_000, maxQueueSize: 100 },
     onEvent: (e) => events.push(e),
     retry: { insertMaxRetries: 1, insertBaseDelayMs: 1, initialDelayMs: 60_000 },
@@ -87,10 +87,9 @@ test('fireAsync with durable mode awaits WAL path', async () => {
   const events: LogbunEvent[] = [];
   const audit = new AuditLogger({
     namespace: 'fire-async-dur',
+    reliability: makeFileReliability('fire-async-dur', dataDir),
     mode: 'durable',
     adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-    dataDir,
-    wal: { fsync: false },
     batching: { maxSize: 100, flushInterval: 60_000 },
     onEvent: (e) => events.push(e),
     retry: { insertMaxRetries: 1, insertBaseDelayMs: 1, initialDelayMs: 60_000 },
@@ -118,7 +117,6 @@ test('fireAsync_rejects_when_requireTenantId_and_tenant_missing_while_fire_does_
     namespace: 'fire-async-throw',
     mode: 'volatile',
     adapter: stubAdapter(),
-    dataDir,
     requireTenantId: true,
     batching: { maxSize: 10, flushInterval: 60_000 },
     retry: { insertMaxRetries: 1, insertBaseDelayMs: 1, initialDelayMs: 60_000 },

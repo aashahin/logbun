@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 
-import { resolveLogbunDir, sanitizeNamespace } from '../src/utils/path';
+import { resolveLogbunDir, sanitizeNamespace } from '../src/durability/filesystem';
 
 describe('sanitizeNamespace', () => {
   test('accepts alphanumeric, underscore, and hyphen within 64 chars', () => {

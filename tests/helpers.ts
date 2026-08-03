@@ -17,6 +17,8 @@ import type {
   LogbunQueryFilters,
   LogbunQueryResult,
 } from '../src/types';
+import { FileReliabilityAdapter } from '../src/durability/filesystem';
+import { MemoryReliabilityAdapter } from '../src/reliability/memory';
 
 export type TempCleanup = {
   tempDataDir: (prefix?: string) => Promise<string>;
@@ -185,7 +187,25 @@ export const FAST_BATCH = {
 export const FAST_RETRY = {
   insertMaxRetries: 1,
   insertBaseDelayMs: 1,
-  initialDelayMs: 60_000,
-  scanIntervalMs: 60_000,
   maxScanAttempts: 3,
 };
+
+
+/** Durable FileReliabilityAdapter for tests (fsync off for speed). */
+export function makeFileReliability(
+  namespace: string,
+  dataDir: string,
+  opts?: { maxDlqEntries?: number; maxWalBytes?: number; encryptionKey?: string | Uint8Array; instanceLock?: boolean },
+): FileReliabilityAdapter {
+  return new FileReliabilityAdapter({
+    namespace,
+    dataDir,
+    instanceLock: opts?.instanceLock ?? false,
+    maxWalBytes: opts?.maxWalBytes,
+    encryptionKey: opts?.encryptionKey,
+    wal: { fsync: false },
+    dlq: { fsync: false, maxEntries: opts?.maxDlqEntries },
+  });
+}
+
+export { FileReliabilityAdapter, MemoryReliabilityAdapter };

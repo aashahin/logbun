@@ -1,3 +1,4 @@
+import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -6,7 +7,7 @@ import { join } from 'node:path';
 import { Batcher } from '../src/engine/batcher';
 import { ConnectionPool } from '../src/engine/pool';
 import { RetryEngine } from '../src/engine/retry';
-import { DLQStorage } from '../src/storage/dlq';
+import { DLQStorage } from '../src/durability/filesystem';
 import type { IAdapter, LogbunLog, LogbunQueryFilters, LogbunQueryResult } from '../src/types';
 
 const cleanupPaths: string[] = [];
@@ -55,12 +56,15 @@ test('batcher insertMaxRetries=2 means exactly 2 bulkInsert attempts', async () 
   const pool = new ConnectionPool(adapter, 5);
   const dlq = new DLQStorage('retry-att', dataDir);
   await dlq.init();
+  const rel = makeFileReliability('rel-ns', dataDir);
+  await rel.init();
+  // use underlying if needed — prefer FileReliabilityAdapter alone
+
 
   const batcher = new Batcher({
     adapter,
     pool,
-    wal: null,
-    dlq,
+    reliability: rel,
     mode: 'volatile',
     batching: {
       maxSize: 1,
@@ -103,11 +107,12 @@ test('batcher insertMaxRetries=1 means single attempt then DLQ', async () => {
   const dlq = new DLQStorage('retry-one', dataDir);
   await dlq.init();
 
+    const rel = makeFileReliability('retry-one', dataDir);
+    await rel.init();
   const batcher = new Batcher({
     adapter,
     pool,
-    wal: null,
-    dlq,
+    reliability: rel,
     mode: 'volatile',
     batching: {
       maxSize: 1,
@@ -122,7 +127,7 @@ test('batcher insertMaxRetries=1 means single attempt then DLQ', async () => {
   await batcher.flushAll();
 
   expect(attempts).toBe(1);
-  expect((await dlq.listPending()).length).toBe(1);
+  expect((await dlq.listPendingPaths()).length).toBe(1);
 });
 
 test('retry engine insertMaxRetries=2 means 2 total attempts per scan', async () => {
@@ -152,8 +157,10 @@ test('retry engine insertMaxRetries=2 means 2 total attempts per scan', async ()
   await dlq.init();
   await dlq.write(null, [makeLog('dlq-1')]);
 
+    const rel = makeFileReliability('retry-eng', dataDir);
+    await rel.init();
   const engine = new RetryEngine({
-    dlq,
+    reliability: rel,
     adapter,
     pool,
     retry: {

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { Elysia } from 'elysia';
 import { Hono } from 'hono';
 
-import { BunSQLiteAdapter } from '../src/adapters/sqlite';
+import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
 import { AuditLogger, ENTERPRISE_DEFAULTS } from '../src/index';
 import {
   auditPlugin,
@@ -21,6 +21,7 @@ import {
   FAST_BATCH,
   FAST_RETRY,
   waitFor,
+  makeFileReliability,
 } from './helpers';
 
 type Actions =
@@ -52,9 +53,8 @@ describe('e2e Hono plugin', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-hono',
-      dataDir,
+      reliability: makeFileReliability('e2e-hono', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'hono.db') }),
-      wal: { fsync: false },
       batching: { maxSize: 5, flushInterval: 25 },
       retry: FAST_RETRY,
     });
@@ -141,9 +141,8 @@ describe('e2e Hono plugin', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-hono-t',
-      dataDir,
+      reliability: makeFileReliability('e2e-hono-t', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-      wal: { fsync: false },
       batching: FAST_BATCH,
       retry: FAST_RETRY,
     });
@@ -180,9 +179,8 @@ describe('e2e Hono plugin', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-hono-ov',
-      dataDir,
+      reliability: makeFileReliability('e2e-hono-ov', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-      wal: { fsync: false },
       batching: { maxSize: 1, flushInterval: 20 },
       retry: FAST_RETRY,
     });
@@ -229,9 +227,8 @@ describe('e2e Elysia plugin', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-ely',
-      dataDir,
+      reliability: makeFileReliability('e2e-ely', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'ely.db') }),
-      wal: { fsync: false },
       batching: { maxSize: 5, flushInterval: 25 },
       retry: FAST_RETRY,
     });
@@ -317,9 +314,8 @@ describe('e2e Elysia plugin', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-ely-xff',
-      dataDir,
+      reliability: makeFileReliability('e2e-ely-xff', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a.db') }),
-      wal: { fsync: false },
       batching: { maxSize: 1, flushInterval: 20 },
       retry: FAST_RETRY,
     });

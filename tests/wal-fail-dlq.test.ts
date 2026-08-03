@@ -5,15 +5,15 @@ import { join } from 'node:path';
 
 import { Batcher } from '../src/engine/batcher';
 import { ConnectionPool } from '../src/engine/pool';
-import { DLQStorage, readBatch } from '../src/storage/dlq';
-import { WALStorage } from '../src/storage/wal';
 import type {
   IAdapter,
   LogbunEvent,
   LogbunLog,
   LogbunQueryFilters,
   LogbunQueryResult,
+  ReliabilityAdapter,
 } from '../src/types';
+import { makeFileReliability } from './helpers';
 
 const cleanupPaths: string[] = [];
 
@@ -51,8 +51,22 @@ function stubAdapter(): IAdapter {
   };
 }
 
+function wrapAppendFail(base: ReliabilityAdapter): ReliabilityAdapter {
+  return new Proxy(base, {
+    get(target, prop, receiver) {
+      if (prop === 'appendJournal') {
+        return async () => {
+          throw new Error('wal disk full');
+        };
+      }
+      const v = Reflect.get(target, prop, receiver);
+      return typeof v === 'function' ? (v as Function).bind(target) : v;
+    },
+  });
+}
+
 /**
- * F2: durable mode + wal.append throw → must not leave the log only in RAM
+ * F2: durable mode + journal append throw → must not leave the log only in RAM
  * with silent success. Either DLQ, drop event, or hard fail (fireAsync).
  */
 test('durable wal.append failure does not silently succeed with RAM-only log', async () => {
@@ -63,21 +77,14 @@ test('durable wal.append failure does not silently succeed with RAM-only log', a
   const adapter = stubAdapter();
   const pool = new ConnectionPool(adapter, 5);
 
-  const realWal = new WALStorage('wal-fail', dataDir, { fsync: false });
-  await realWal.init();
-  const wal: WALStorage = Object.create(realWal) as WALStorage;
-  wal.append = async () => {
-    throw new Error('wal disk full');
-  };
-
-  const dlq = new DLQStorage('wal-fail', dataDir);
-  await dlq.init();
+  const real = makeFileReliability('wal-fail', dataDir);
+  await real.init();
+  const rel = wrapAppendFail(real);
 
   const batcher = new Batcher({
     adapter,
     pool,
-    wal,
-    dlq,
+    reliability: rel,
     mode: 'durable',
     batching: {
       maxSize: 100,
@@ -97,29 +104,26 @@ test('durable wal.append failure does not silently succeed with RAM-only log', a
     threw = true;
   }
 
-  const pending = await dlq.listPending();
+  const pending = await real.listDlq({ includePending: true });
   let inDlq = false;
-  for (const p of pending) {
-    const batch = await readBatch(p);
-    if (batch.logs.some((l) => l.id === log.id)) inDlq = true;
+  for (const e of pending) {
+    const batch = await real.readDlq(e.id);
+    if (batch?.logs.some((l) => l.id === log.id)) inDlq = true;
   }
 
   const dropped = events.some((e) => e.type === 'drop');
   const walFail = events.some((e) => e.type === 'wal_fail');
   const enqueued = events.some((e) => e.type === 'enqueue');
 
-  // Contract: not silent success without durability path.
-  // Acceptable: DLQ copy, drop event, or throw. Not: enqueue-only with RAM.
   const durablePath = inDlq || dropped || threw;
   expect(walFail || durablePath).toBe(true);
   expect(durablePath).toBe(true);
 
-  // If it claimed enqueue success, must also have DLQ (not RAM-only).
   if (enqueued) {
     expect(inDlq || dropped).toBe(true);
   }
 
-  await realWal.close();
+  await real.close();
 });
 
 test('enqueue_returns_true_with_dlq_when_wal_fails_but_dlq_succeeds', async () => {
@@ -130,21 +134,14 @@ test('enqueue_returns_true_with_dlq_when_wal_fails_but_dlq_succeeds', async () =
   const adapter = stubAdapter();
   const pool = new ConnectionPool(adapter, 5);
 
-  const realWal = new WALStorage('wal-fail-fa', dataDir, { fsync: false });
-  await realWal.init();
-  const wal: WALStorage = Object.create(realWal) as WALStorage;
-  wal.append = async () => {
-    throw new Error('wal hard fail');
-  };
-
-  const dlq = new DLQStorage('wal-fail-fa', dataDir);
-  await dlq.init();
+  const real = makeFileReliability('wal-fail-fa', dataDir);
+  await real.init();
+  const rel = wrapAppendFail(real);
 
   const batcher = new Batcher({
     adapter,
     pool,
-    wal,
-    dlq,
+    reliability: rel,
     mode: 'durable',
     batching: {
       maxSize: 100,
@@ -159,12 +156,11 @@ test('enqueue_returns_true_with_dlq_when_wal_fails_but_dlq_succeeds', async () =
   const log = makeLog('async-wal-fail', 't-async');
   const result = await batcher.enqueue(log);
 
-  // WAL fail + healthy DLQ → success via DLQ, no RAM enqueue
   expect(result).toBe(true);
   expect(events.some((e) => e.type === 'wal_fail')).toBe(true);
   expect(events.some((e) => e.type === 'dlq')).toBe(true);
   expect(events.some((e) => e.type === 'enqueue')).toBe(false);
-  expect((await dlq.listPending()).length).toBe(1);
+  expect((await real.listDlq({ includePending: true })).length).toBe(1);
 
-  await realWal.close();
+  await real.close();
 });

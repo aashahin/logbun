@@ -8,7 +8,7 @@
 import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 
-import { BunSQLiteAdapter } from '../src/adapters/sqlite';
+import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
 import { AuditLogger, ENTERPRISE_DEFAULTS } from '../src/index';
 import {
   installTestCleanup,
@@ -18,6 +18,7 @@ import {
   memoryAdapter,
   sleep,
   waitFor,
+  makeFileReliability,
 } from './helpers';
 
 type Actions = 'evt.a' | 'evt.b' | 'evt.c';
@@ -31,12 +32,11 @@ describe('e2e stress & production shape', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-1k',
-      dataDir,
+      reliability: makeFileReliability('e2e-1k', dataDir),
       adapter: new BunSQLiteAdapter({
         path: join(dataDir, 'bulk.db'),
         synchronous: 'NORMAL',
       }),
-      wal: { fsync: false },
       batching: { maxSize: 50, flushInterval: 50, maxQueueSize: 5_000 },
       maxFlushConcurrency: 8,
       retry: FAST_RETRY,
@@ -101,9 +101,8 @@ describe('e2e stress & production shape', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-stats',
-      dataDir,
+      reliability: makeFileReliability('e2e-stats', dataDir),
       adapter: memoryAdapter({ delayMs: 5 }),
-      wal: { fsync: false },
       batching: { maxSize: 20, flushInterval: 40, maxQueueSize: 500 },
       retry: FAST_RETRY,
     });
@@ -158,9 +157,8 @@ describe('e2e stress & production shape', () => {
       const audit = new AuditLogger<Actions>({
         ...ENTERPRISE_DEFAULTS,
         namespace: 'e2e-cycle',
-        dataDir,
+        reliability: makeFileReliability('e2e-cycle', dataDir),
         adapter: new BunSQLiteAdapter({ path: dbPath }),
-        wal: { fsync: false },
         batching: { maxSize: 5, flushInterval: 20, maxQueueSize: 100 },
         retry: FAST_RETRY,
       });
@@ -204,9 +202,8 @@ describe('e2e stress & production shape', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-fair',
-      dataDir,
+      reliability: makeFileReliability('e2e-fair', dataDir),
       adapter: memoryAdapter({ delayMs: 300 }),
-      wal: { fsync: false },
       maxTotalQueued: 20,
       maxActiveTenants: 50,
       batching: {
@@ -250,9 +247,8 @@ describe('e2e stress & production shape', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-filt',
-      dataDir,
+      reliability: makeFileReliability('e2e-filt', dataDir),
       adapter: new BunSQLiteAdapter({ path: join(dataDir, 'f.db') }),
-      wal: { fsync: false },
       batching: { maxSize: 10, flushInterval: 25 },
       retry: FAST_RETRY,
     });

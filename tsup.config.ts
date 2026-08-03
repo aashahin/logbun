@@ -1,14 +1,22 @@
 import { defineConfig } from 'tsup'
 
+/**
+ * Universal package builds (Node/Bun/Deno consumers):
+ * Core + plugins + filesystem durability + optional adapters: ESM + CJS
+ *
+ * Cloudflare durability is built separately (ESM only) via tsup.cloudflare.config.ts
+ * so a parallel clean cannot wipe its outputs.
+ */
 export default defineConfig({
-  entry: [
-    'src/index.ts',
-    'src/adapters/sqlite.ts',
-    'src/adapters/turso.ts',
-    'src/adapters/clickhouse.ts',
-    'src/plugins/elysia.ts',
-    'src/plugins/hono.ts',
-  ],
+  entry: {
+    index: 'src/index.ts',
+    'durability/filesystem/index': 'src/durability/filesystem/index.ts',
+    'adapters/bun-sqlite': 'src/adapters/bun-sqlite.ts',
+    'adapters/turso': 'src/adapters/turso.ts',
+    'adapters/clickhouse': 'src/adapters/clickhouse.ts',
+    'plugins/elysia': 'src/plugins/elysia.ts',
+    'plugins/hono': 'src/plugins/hono.ts',
+  },
   format: ['esm', 'cjs'],
   dts: true,
   splitting: true,
@@ -24,5 +32,10 @@ export default defineConfig({
     '@clickhouse/client',
     'elysia',
     'hono',
+    'node:fs',
+    'node:fs/promises',
+    'node:path',
+    'node:readline',
+    'node:os',
   ],
 })

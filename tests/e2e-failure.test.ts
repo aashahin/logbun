@@ -4,7 +4,7 @@
 import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 
-import { BunSQLiteAdapter } from '../src/adapters/sqlite';
+import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
 import { AuditLogger, ENTERPRISE_DEFAULTS } from '../src/index';
 import type { IAdapter, LogbunLog } from '../src/types';
 import {
@@ -15,6 +15,7 @@ import {
   memoryAdapter,
   sleep,
   waitFor,
+  makeFileReliability,
 } from './helpers';
 
 type Actions = 'order.placed' | 'order.failed' | 'admin.action';
@@ -34,9 +35,8 @@ describe('e2e failure & backpressure', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-dlq',
-      dataDir,
+      reliability: makeFileReliability('e2e-dlq', dataDir),
       adapter,
-      wal: { fsync: false },
       batching: {
         maxSize: 2,
         flushInterval: 30,
@@ -46,7 +46,6 @@ describe('e2e failure & backpressure', () => {
       retry: {
         insertMaxRetries: 1,
         insertBaseDelayMs: 1,
-        initialDelayMs: 60_000,
         maxScanAttempts: 2,
       },
       onEvent,
@@ -106,9 +105,8 @@ describe('e2e failure & backpressure', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-poison',
-      dataDir,
+      reliability: makeFileReliability('e2e-poison', dataDir),
       adapter,
-      wal: { fsync: false },
       batching: {
         maxSize: 1,
         flushInterval: 20,
@@ -118,7 +116,6 @@ describe('e2e failure & backpressure', () => {
       retry: {
         insertMaxRetries: 1,
         insertBaseDelayMs: 1,
-        initialDelayMs: 60_000,
         maxScanAttempts: 2,
       },
       onEvent,
@@ -156,7 +153,7 @@ describe('e2e failure & backpressure', () => {
 
     // Requeue and heal
     fail = false;
-    const requeuedPath = await audit.requeueDead(deadFiles[0]!.path);
+    const requeuedPath = await audit.requeueDead(deadFiles[0]!.id);
     expect(typeof requeuedPath).toBe('string');
 
     await audit.retryDlqNow();
@@ -172,9 +169,8 @@ describe('e2e failure & backpressure', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-deldead',
-      dataDir,
+      reliability: makeFileReliability('e2e-deldead', dataDir),
       adapter,
-      wal: { fsync: false },
       batching: {
         maxSize: 1,
         flushInterval: 20,
@@ -184,7 +180,6 @@ describe('e2e failure & backpressure', () => {
       retry: {
         insertMaxRetries: 1,
         insertBaseDelayMs: 1,
-        initialDelayMs: 60_000,
         maxScanAttempts: 1,
       },
     });
@@ -217,12 +212,12 @@ describe('e2e failure & backpressure', () => {
       includePending: false,
     });
     if (after.length > 0) {
-      await audit.deleteDead(after[0]!.path);
+      await audit.deleteDead(after[0]!.id);
       const remaining = await audit.listDlq({
         includeDead: true,
         includePending: false,
       });
-      expect(remaining.find((f) => f.path === after[0]!.path)).toBeUndefined();
+      expect(remaining.find((f) => f.path === after[0]!.id)).toBeUndefined();
     } else {
       // At least DLQ ops path is reachable without throwing
       const pending = await audit.listDlq({ includePending: true });
@@ -240,7 +235,6 @@ describe('e2e failure & backpressure', () => {
       namespace: 'e2e-drop',
       mode: 'volatile',
       requireTenantId: true,
-      dataDir,
       adapter: memoryAdapter({ delayMs: 200 }),
       batching: {
         maxSize: 100,
@@ -281,10 +275,9 @@ describe('e2e failure & backpressure', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-qfull',
-      dataDir,
+      reliability: makeFileReliability('e2e-qfull', dataDir),
       // Slow remote so queue builds
       adapter: memoryAdapter({ delayMs: 150 }),
-      wal: { fsync: false },
       batching: {
         maxSize: 100,
         flushInterval: 60_000,
@@ -344,9 +337,8 @@ describe('e2e failure & backpressure', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-degraded',
-      dataDir,
+      reliability: makeFileReliability('e2e-degraded', dataDir),
       adapter: broken,
-      wal: { fsync: false },
       batching: FAST_BATCH,
       retry: FAST_RETRY,
       onEvent,
@@ -388,9 +380,8 @@ describe('e2e failure & backpressure', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-maxt',
-      dataDir,
+      reliability: makeFileReliability('e2e-maxt', dataDir),
       adapter: memoryAdapter(),
-      wal: { fsync: false },
       maxActiveTenants: 2,
       batching: {
         maxSize: 100,
@@ -460,14 +451,12 @@ describe('e2e failure & backpressure', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-retry',
-      dataDir,
+      reliability: makeFileReliability('e2e-retry', dataDir),
       adapter,
-      wal: { fsync: false },
       batching: { maxSize: 1, flushInterval: 20, maxQueueSize: 20 },
       retry: {
         insertMaxRetries: 5,
         insertBaseDelayMs: 5,
-        initialDelayMs: 60_000,
       },
     });
     await audit.ready;
@@ -505,15 +494,12 @@ describe('e2e failure & backpressure', () => {
     const audit = new AuditLogger<Actions>({
       ...ENTERPRISE_DEFAULTS,
       namespace: 'e2e-mixed',
-      dataDir,
+      reliability: makeFileReliability('e2e-mixed', dataDir),
       adapter,
-      wal: { fsync: false },
       batching: { maxSize: 2, flushInterval: 25, maxQueueSize: 100 },
       retry: {
         insertMaxRetries: 3,
         insertBaseDelayMs: 5,
-        initialDelayMs: 100,
-        scanIntervalMs: 100,
         maxScanAttempts: 5,
       },
     });

@@ -1,8 +1,10 @@
-import {
-  tenantIdFromFilename,
-  type DLQStorage,
-} from '../storage/dlq';
-import type { IAdapter, LogbunEvent, LogbunLog, RetryConfig } from '../types';
+import type {
+  IAdapter,
+  LogbunEvent,
+  LogbunLog,
+  ReliabilityAdapter,
+  RetryConfig,
+} from '../types';
 import type { ConnectionPool } from './pool';
 import { safeEmit, type LogbunEventHandler } from '../events';
 
@@ -10,13 +12,12 @@ const DEFAULT_MAX_SCAN_ATTEMPTS = 10;
 /** insertMaxRetries = total bulkInsert attempts (default 3). */
 const DEFAULT_INSERT_MAX_RETRIES = 3;
 const DEFAULT_INSERT_BASE_DELAY_MS = 1_000;
-const DEFAULT_SCAN_INTERVAL_MS = 60_000;
-/** Max pending DLQ files processed concurrently per scan. */
+/** Max pending DLQ entries processed concurrently per scan. */
 const PROCESS_CONCURRENCY = 4;
 
 /** Constructor deps for {@link RetryEngine}. */
 export interface RetryEngineDeps {
-  dlq: DLQStorage;
+  reliability: ReliabilityAdapter;
   adapter: IAdapter;
   pool: ConnectionPool;
   retry?: RetryConfig;
@@ -28,26 +29,25 @@ export interface RetryEngineDeps {
  *
  * Poison pill uses the durable envelope `attempts` field only (survives restarts).
  * Tenant adapters never fall back to the base adapter.
+ *
+ * Hosts schedule scans via {@link RetryEngine.scan} (from AuditLogger.runMaintenance
+ * or retryDlqNow). No recurring timers.
  */
 export class RetryEngine {
-  private readonly dlq: DLQStorage;
+  private readonly reliability: ReliabilityAdapter;
   private readonly pool: ConnectionPool;
   private readonly adapter: IAdapter;
   private readonly onEvent?: LogbunEventHandler;
-  private readonly scanInterval: number;
   private readonly maxScanAttempts: number;
   private readonly insertMaxRetries: number;
   private readonly insertBaseDelayMs: number;
 
-  private intervalTimer: ReturnType<typeof setInterval> | null = null;
-  private initialTimer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
 
   constructor(deps: RetryEngineDeps) {
-    this.dlq = deps.dlq;
+    this.reliability = deps.reliability;
     this.adapter = deps.adapter;
     this.pool = deps.pool;
-    this.scanInterval = deps.retry?.scanIntervalMs ?? DEFAULT_SCAN_INTERVAL_MS;
     this.maxScanAttempts =
       deps.retry?.maxScanAttempts ?? DEFAULT_MAX_SCAN_ATTEMPTS;
     this.insertMaxRetries =
@@ -61,38 +61,34 @@ export class RetryEngine {
     safeEmit(this.onEvent, e);
   }
 
-  start(initialDelayMs?: number): void {
-    const delay = initialDelayMs ?? 10_000;
-    this.initialTimer = setTimeout(() => {
-      this.initialTimer = null;
-      void this.scan();
-      this.intervalTimer = setInterval(() => {
-        void this.scan();
-      }, this.scanInterval);
-    }, delay);
+  /**
+   * @deprecated Recurring timers removed in 1.0 — use host-scheduled
+   * {@link scan} via AuditLogger.runMaintenance(). No-op for compatibility.
+   */
+  start(_initialDelayMs?: number): void {
+    /* no-op: hosts schedule maintenance */
   }
 
+  /**
+   * @deprecated No recurring timers in 1.0. No-op for compatibility.
+   */
   stop(): void {
-    if (this.initialTimer) {
-      clearTimeout(this.initialTimer);
-      this.initialTimer = null;
-    }
-    if (this.intervalTimer) {
-      clearInterval(this.intervalTimer);
-      this.intervalTimer = null;
-    }
+    /* no-op */
   }
 
   async scan(): Promise<void> {
     if (this.running) return;
     this.running = true;
     try {
-      const pending = await this.dlq.listPending();
-      // Bounded parallel: process up to PROCESS_CONCURRENCY files at a time
+      const pending = await this.reliability.listDlq({
+        includePending: true,
+        includeProcessing: false,
+        includeDead: false,
+      });
       for (let i = 0; i < pending.length; i += PROCESS_CONCURRENCY) {
         const chunk = pending.slice(i, i + PROCESS_CONCURRENCY);
         await Promise.allSettled(
-          chunk.map((filePath) => this.processBatch(filePath))
+          chunk.map((entry) => this.processBatch(entry.id))
         );
       }
     } finally {
@@ -100,46 +96,32 @@ export class RetryEngine {
     }
   }
 
-  private async processBatch(filePath: string): Promise<void> {
-    let processingPath: string;
+  private async processBatch(id: string): Promise<void> {
+    let claimed;
     try {
-      processingPath = await this.dlq.markProcessing(filePath);
+      claimed = await this.reliability.claimDlq(id);
     } catch {
       return;
     }
+    if (!claimed) return;
 
-    let logs: LogbunLog[] = [];
-    let tenantId: string | null = null;
-    let attempts = 0;
+    const { tenantId, logs } = claimed;
+    let attempts = claimed.attempts;
 
     try {
-      const batch = await this.dlq.readBatchFile(processingPath);
-      logs = batch.logs;
-      // Prefer envelope tenantId (raw) over sanitized filename key
-      tenantId = batch.tenantId ?? tenantIdFromFilename(processingPath);
-      attempts =
-        typeof batch.attempts === 'number' && Number.isFinite(batch.attempts)
-          ? batch.attempts
-          : 0;
-
       if (attempts >= this.maxScanAttempts) {
-        await this.poison(processingPath, tenantId, attempts, filePath);
+        await this.poison(claimed.id, tenantId, attempts, id);
         return;
       }
 
       if (!Array.isArray(logs) || logs.length === 0) {
-        await this.poison(
-          processingPath,
-          tenantId,
-          attempts,
-          'empty_or_invalid'
-        );
+        await this.poison(claimed.id, tenantId, attempts, 'empty_or_invalid');
         return;
       }
 
       const insertResult = await this.insertWithAdapter(
         tenantId,
-        processingPath,
+        claimed.id,
         attempts,
         logs
       );
@@ -147,7 +129,7 @@ export class RetryEngine {
 
       const { ok, error } = insertResult;
       if (ok) {
-        await this.dlq.markDone(processingPath);
+        await this.reliability.settleDlqSuccess(claimed.id);
         this.emit({
           type: 'flush_ok',
           tenantId,
@@ -157,7 +139,7 @@ export class RetryEngine {
         return;
       }
 
-      await this.failWithAttempts(processingPath, attempts);
+      await this.failWithAttempts(claimed.id, attempts);
       if (error) {
         this.emit({
           type: 'flush_fail',
@@ -169,20 +151,16 @@ export class RetryEngine {
       }
     } catch {
       try {
-        await this.failWithAttempts(processingPath, attempts);
+        await this.failWithAttempts(claimed.id, attempts);
       } catch {
         // nothing we can do
       }
     }
   }
 
-  /**
-   * Resolve adapter and bulk-insert. Never falls back to base for a tenant.
-   * @returns null when tenant adapter resolution failed (already re-queued)
-   */
   private async insertWithAdapter(
     tenantId: string | null,
-    processingPath: string,
+    claimId: string,
     attempts: number,
     logs: LogbunLog[]
   ): Promise<{ ok: boolean; error?: string } | null> {
@@ -195,8 +173,7 @@ export class RetryEngine {
         this.bulkInsertWithBackoff(adapter, tenantId, logs)
       );
     } catch (err) {
-      // Never fall back to base adapter for a real tenant
-      await this.failWithAttempts(processingPath, attempts);
+      await this.failWithAttempts(claimId, attempts);
       this.emit({
         type: 'flush_fail',
         tenantId,
@@ -208,11 +185,6 @@ export class RetryEngine {
     }
   }
 
-  /**
-   * bulkInsert with exponential backoff.
-   * insertMaxRetries is the **total** number of attempts (default 3).
-   * Delays apply between retries only.
-   */
   private async bulkInsertWithBackoff(
     adapter: IAdapter,
     tenantId: string | null,
@@ -238,13 +210,13 @@ export class RetryEngine {
   }
 
   private async poison(
-    processingPath: string,
+    id: string,
     tenantId: string | null,
     attempts: number,
     detail: string
   ): Promise<void> {
     try {
-      await this.dlq.markPoisoned(processingPath);
+      await this.reliability.poisonDlq(id);
       this.emit({
         type: 'poison',
         tenantId,
@@ -257,18 +229,13 @@ export class RetryEngine {
   }
 
   private async failWithAttempts(
-    processingPath: string,
+    id: string,
     currentAttempts: number
   ): Promise<void> {
     try {
-      await this.dlq.incrementAttempts(processingPath, currentAttempts);
+      await this.reliability.settleDlqFailure(id, currentAttempts + 1);
     } catch {
-      // still try to re-queue
-    }
-    try {
-      await this.dlq.markFailed(processingPath);
-    } catch {
-      // filesystem error
+      // filesystem / storage error
     }
   }
 }

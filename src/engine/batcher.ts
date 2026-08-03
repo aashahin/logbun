@@ -5,9 +5,8 @@ import type {
   IAdapter,
   LogbunEvent,
   RetryConfig,
+  ReliabilityAdapter,
 } from '../types';
-import type { WALStorage } from '../storage/wal';
-import type { DLQStorage } from '../storage/dlq';
 import type { ConnectionPool } from './pool';
 import { safeEmit, type LogbunEventHandler } from '../events';
 
@@ -31,13 +30,12 @@ const DEFAULT_MAX_FLUSH_CONCURRENCY = 16;
 export interface BatcherDeps {
   adapter: IAdapter;
   pool: ConnectionPool;
-  wal: WALStorage | null;
-  dlq: DLQStorage;
+  reliability: ReliabilityAdapter;
   mode: DurabilityMode;
   batching?: Partial<BatchingConfig>;
   onEvent?: LogbunEventHandler;
   retry?: RetryConfig;
-  /** Max logs injected from WAL per wave. @default maxQueueSize */
+  /** Max logs injected from journal recovery per wave. @default maxQueueSize */
   maxRecoveryBatch?: number;
   /**
    * Max concurrent queue keys (tenant map size).
@@ -60,11 +58,6 @@ export interface BatcherDeps {
    * @default 16
    */
   maxFlushConcurrency?: number;
-  /**
-   * Soft/hard WAL recovery size guidance (passthrough; WAL owns enforcement).
-   * @default 64 * 1024 * 1024
-   */
-  maxWalBytes?: number;
 }
 
 export interface BatcherStats {
@@ -96,8 +89,7 @@ export class Batcher {
 
   private readonly config: BatchingConfig;
   private readonly mode: DurabilityMode;
-  private readonly wal: WALStorage | null;
-  private readonly dlq: DLQStorage;
+  private readonly reliability: ReliabilityAdapter;
   private readonly pool: ConnectionPool;
   private readonly adapter: IAdapter;
   private readonly onEvent?: LogbunEventHandler;
@@ -118,8 +110,7 @@ export class Batcher {
   constructor(deps: BatcherDeps) {
     this.adapter = deps.adapter;
     this.pool = deps.pool;
-    this.wal = deps.wal;
-    this.dlq = deps.dlq;
+    this.reliability = deps.reliability;
     this.mode = deps.mode;
     this.config = { ...DEFAULT_BATCHING, ...deps.batching };
     this.onEvent = deps.onEvent;
@@ -137,8 +128,6 @@ export class Batcher {
       1,
       deps.maxFlushConcurrency ?? DEFAULT_MAX_FLUSH_CONCURRENCY
     );
-    // maxWalBytes is accepted for API symmetry; WAL enforces size limits.
-
     if (this.mode === 'durable' && this.config.onQueueFull === 'drop') {
       throw new Error(
         'Configuration error: onQueueFull="drop" is not valid with mode="durable". ' +
@@ -304,7 +293,7 @@ export class Batcher {
           }
 
           if (insertResult.ok) {
-            await this.acknowledgeWal(snapshot);
+            await this.acknowledgeJournal(snapshot);
             this.emit({ type: 'flush_ok', tenantId, count: snapshot.length });
             this.rearmAfterChunk(key);
             this.drainRecoveryBacklog();
@@ -439,9 +428,9 @@ export class Batcher {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
 
-    if (this.mode === 'durable' && this.wal) {
+    if (this.mode === 'durable' && this.reliability.persistent) {
       try {
-        await this.wal.compact();
+        await this.reliability.compactJournal();
       } catch {
         // Non-fatal; unacked entries remain for next boot
       }
@@ -589,17 +578,17 @@ export class Batcher {
         this.emit({ type: 'drop', tenantId, count: 1, detail: 'shutdown' });
         return false;
       }
-      if (this.wal) {
+      if (this.reliability.persistent) {
         try {
-          await this.wal.append(log);
+          await this.reliability.appendJournal(log);
         } catch {
           this.emit({ type: 'wal_fail', tenantId, detail: 'shutdown_enqueue' });
         }
       }
       try {
-        await this.dlq.write(tenantId, [log]);
-        // Ack WAL only after DLQ success so shutdown path cannot lose the only copy
-        await this.acknowledgeWal([log]);
+        await this.reliability.writeDlq(tenantId, [log]);
+        // Ack journal only after DLQ success so shutdown path cannot lose the only copy
+        await this.acknowledgeJournal([log]);
         this.emit({ type: 'dlq', tenantId, count: 1, detail: 'shutdown' });
         return true;
       } catch (err) {
@@ -769,10 +758,10 @@ export class Batcher {
     log: LogbunLog,
     tenantId: string | null
   ): Promise<boolean> {
-    if (this.mode === 'durable' && this.wal) {
+    if (this.mode === 'durable' && this.reliability.persistent) {
       try {
-        await this.dlq.write(tenantId, [log]);
-        await this.acknowledgeWal([log]);
+        await this.reliability.writeDlq(tenantId, [log]);
+        await this.acknowledgeJournal([log]);
         this.emit({
           type: 'dlq',
           tenantId,
@@ -809,15 +798,15 @@ export class Batcher {
     log: LogbunLog,
     tenantId: string | null
   ): Promise<'ok' | 'dlq' | 'fail'> {
-    if (this.mode !== 'durable' || !this.wal) return 'ok';
+    if (this.mode !== 'durable' || !this.reliability.persistent) return 'ok';
     try {
-      await this.wal.append(log);
+      await this.reliability.appendJournal(log);
       return 'ok';
     } catch (err) {
       const walMsg = err instanceof Error ? err.message : String(err);
       const walFull = walMsg.includes('wal_full');
       try {
-        await this.dlq.write(tenantId, [log]);
+        await this.reliability.writeDlq(tenantId, [log]);
         this.emit({
           type: 'wal_fail',
           tenantId,
@@ -873,8 +862,8 @@ export class Batcher {
       );
     } catch (err) {
       try {
-        await this.dlq.write(tenantId, snapshot);
-        await this.acknowledgeWal(snapshot);
+        await this.reliability.writeDlq(tenantId, snapshot);
+        await this.acknowledgeJournal(snapshot);
         this.emit({
           type: 'dlq',
           tenantId,
@@ -937,8 +926,8 @@ export class Batcher {
     detail: string
   ): Promise<void> {
     try {
-      await this.dlq.write(tenantId, snapshot);
-      await this.acknowledgeWal(snapshot);
+      await this.reliability.writeDlq(tenantId, snapshot);
+      await this.acknowledgeJournal(snapshot);
       this.emit({
         type: 'dlq',
         tenantId,
@@ -951,10 +940,10 @@ export class Batcher {
     }
   }
 
-  private async acknowledgeWal(logs: LogbunLog[]): Promise<void> {
-    if (this.mode !== 'durable' || !this.wal || logs.length === 0) return;
+  private async acknowledgeJournal(logs: LogbunLog[]): Promise<void> {
+    if (this.mode !== 'durable' || !this.reliability.persistent || logs.length === 0) return;
     try {
-      await this.wal.acknowledge(logs.map((l) => l.id));
+      await this.reliability.acknowledgeJournal(logs.map((l) => l.id));
     } catch {
       // Non-fatal — adapters are idempotent on replay
     }
@@ -976,15 +965,15 @@ export class Batcher {
     queue.length = 0;
     this.clearTimer(key);
     try {
-      await this.dlq.write(tenantId, snapshot);
+      await this.reliability.writeDlq(tenantId, snapshot);
     } catch (err) {
-      // Restore without acking WAL — never leave the only copy only in-flight
+      // Restore without acking journal — never leave the only copy only in-flight
       queue.unshift(...snapshot);
       // Always emit: dlq_full is the common ops signal; other write errors surface too
       this.emitDlqWriteFail(tenantId, snapshot.length, err, 'backpressure_dlq_fail');
       return false;
     }
-    await this.acknowledgeWal(snapshot);
+    await this.acknowledgeJournal(snapshot);
     this.maybePruneQueue(key);
     this.emit({
       type: 'dlq',

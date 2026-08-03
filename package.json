@@ -1,58 +1,81 @@
 {
   "name": "logbun",
-  "version": "0.2.1",
+  "version": "1.0.0",
   "type": "module",
-  "description": "Production-ready audit logging for Bun-based multi-tenant SaaS platforms.",
+  "description": "Runtime-agnostic audit logging for Node.js, Bun, Deno, and Cloudflare Workers.",
   "license": "MIT",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "sideEffects": false,
   "engines": {
-    "bun": ">=1.3.0"
+    "node": ">=18"
   },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.js"
     },
-    "./adapters/sqlite": {
-      "types": "./dist/adapters/sqlite.d.ts",
-      "import": "./dist/adapters/sqlite.js",
-      "require": "./dist/adapters/sqlite.cjs"
+    "./durability/filesystem": {
+      "types": "./dist/durability/filesystem/index.d.ts",
+      "import": "./dist/durability/filesystem/index.js",
+      "require": "./dist/durability/filesystem/index.cjs",
+      "default": "./dist/durability/filesystem/index.js"
+    },
+    "./durability/cloudflare": {
+      "types": "./dist/durability/cloudflare/index.d.ts",
+      "import": "./dist/durability/cloudflare/index.js",
+      "default": "./dist/durability/cloudflare/index.js"
+    },
+    "./adapters/bun-sqlite": {
+      "types": "./dist/adapters/bun-sqlite.d.ts",
+      "import": "./dist/adapters/bun-sqlite.js",
+      "require": "./dist/adapters/bun-sqlite.cjs",
+      "default": "./dist/adapters/bun-sqlite.js"
     },
     "./adapters/turso": {
       "types": "./dist/adapters/turso.d.ts",
       "import": "./dist/adapters/turso.js",
-      "require": "./dist/adapters/turso.cjs"
+      "require": "./dist/adapters/turso.cjs",
+      "default": "./dist/adapters/turso.js"
     },
     "./adapters/clickhouse": {
       "types": "./dist/adapters/clickhouse.d.ts",
       "import": "./dist/adapters/clickhouse.js",
-      "require": "./dist/adapters/clickhouse.cjs"
+      "require": "./dist/adapters/clickhouse.cjs",
+      "default": "./dist/adapters/clickhouse.js"
     },
     "./plugins/elysia": {
       "types": "./dist/plugins/elysia.d.ts",
       "import": "./dist/plugins/elysia.js",
-      "require": "./dist/plugins/elysia.cjs"
+      "require": "./dist/plugins/elysia.cjs",
+      "default": "./dist/plugins/elysia.js"
     },
     "./plugins/hono": {
       "types": "./dist/plugins/hono.d.ts",
       "import": "./dist/plugins/hono.js",
-      "require": "./dist/plugins/hono.cjs"
+      "require": "./dist/plugins/hono.cjs",
+      "default": "./dist/plugins/hono.js"
     }
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && tsup --config tsup.cloudflare.config.ts",
     "dev": "tsup --watch",
     "test": "bun test",
-    "typecheck": "bunx tsc --noEmit",
-    "lint": "bunx eslint .",
-    "prepublishOnly": "bun run build"
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.core.json --noEmit",
+    "typecheck:core": "tsc -p tsconfig.core.json --noEmit",
+    "assert:root-runtime": "bun scripts/assert-root-runtime.mjs",
+    "smoke:node": "node scripts/smoke-node.mjs",
+    "smoke:bun": "bun scripts/smoke-bun.ts",
+    "smoke:deno": "node scripts/smoke-deno.mjs",
+    "smoke:cloudflare": "node scripts/smoke-cloudflare.mjs",
+    "pack:check": "node scripts/pack-check.mjs",
+    "prepublishOnly": "bun run build && bun run assert:root-runtime"
   },
   "peerDependencies": {
     "@libsql/client": ">=0.6.0",
@@ -77,8 +100,10 @@
   "devDependencies": {
     "@types/bun": "latest",
     "@types/node": "^26.1.2",
+    "deno": "2.9.4",
     "elysia": "^1.2.25",
     "hono": "^4.7.0",
+    "miniflare": "4.20260730.0",
     "tsup": "^8.4.0",
     "typescript": "5.7.3"
   },
@@ -92,19 +117,13 @@
     "logging",
     "audit-log",
     "audit-logging",
-    "audit-log-storage",
-    "audit-log-storage-provider",
-    "audit-log-storage-provider-turso",
-    "audit-log-storage-provider-clickhouse",
-    "audit-log-storage-provider-sqlite",
-    "audit-log-storage-provider-factory",
-    "audit-log-storage-provider-factory-turso",
-    "audit-log-storage-provider-factory-clickhouse",
-    "audit-log-storage-provider-factory-sqlite",
-    "audit-log-storage-provider-factory-turso-clickhouse-sqlite",
+    "nodejs",
     "bun",
-    "bunjs",
+    "deno",
+    "cloudflare-workers",
     "elysia",
-    "hono"
+    "hono",
+    "turso",
+    "clickhouse"
   ]
 }

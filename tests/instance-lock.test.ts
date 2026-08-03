@@ -1,11 +1,12 @@
+import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { InstanceLock, InstanceLockError } from '../src/storage/instance-lock';
+import { InstanceLock, InstanceLockError } from '../src/durability/filesystem';
 import { AuditLogger } from '../src/logger';
-import { BunSQLiteAdapter } from '../src/adapters/sqlite';
+import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
 
 const cleanupPaths: string[] = [];
 
@@ -34,22 +35,22 @@ test('durable mode acquires instance lock by default; second logger degrades', a
 
   const audit1 = new AuditLogger({
     namespace: 'same-ns',
+    reliability: makeFileReliability('same-ns', dataDir, {
+      instanceLock: true,
+    }),
     mode: 'durable',
-    dataDir,
     adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a1.db') }),
-    wal: { fsync: false },
-    dlqFsync: false,
   });
   await audit1.ready;
   expect(audit1.degraded).toBe(false);
 
   const audit2 = new AuditLogger({
     namespace: 'same-ns',
+    reliability: makeFileReliability('same-ns', dataDir, {
+      instanceLock: true,
+    }),
     mode: 'durable',
-    dataDir,
     adapter: new BunSQLiteAdapter({ path: join(dataDir, 'a2.db') }),
-    wal: { fsync: false },
-    dlqFsync: false,
   });
   await audit2.ready;
   expect(audit2.degraded).toBe(true);
@@ -64,21 +65,15 @@ test('instanceLock: false allows two durable loggers on same namespace', async (
 
   const audit1 = new AuditLogger({
     namespace: 'shared',
+    reliability: makeFileReliability('shared', dataDir),
     mode: 'durable',
-    dataDir,
-    instanceLock: false,
     adapter: new BunSQLiteAdapter({ path: join(dataDir, 'b1.db') }),
-    wal: { fsync: false },
-    dlqFsync: false,
   });
   const audit2 = new AuditLogger({
     namespace: 'shared',
+    reliability: makeFileReliability('shared', dataDir),
     mode: 'durable',
-    dataDir,
-    instanceLock: false,
     adapter: new BunSQLiteAdapter({ path: join(dataDir, 'b2.db') }),
-    wal: { fsync: false },
-    dlqFsync: false,
   });
   await Promise.all([audit1.ready, audit2.ready]);
   expect(audit1.degraded).toBe(false);

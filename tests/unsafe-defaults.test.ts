@@ -1,3 +1,4 @@
+import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -51,15 +52,12 @@ test('onEvent receives limit/unsafe_default_volatile when mode omitted', async (
     namespace: 'unsafe-vol',
     // mode omitted → volatile default
     adapter: okAdapter(),
-    dataDir,
     requireTenantId: true,
     onEvent: (e) => events.push(e),
     batching: { maxSize: 100, flushInterval: 60_000 },
     retry: {
       insertMaxRetries: 1,
       insertBaseDelayMs: 1,
-      initialDelayMs: 60_000,
-      scanIntervalMs: 60_000,
     },
   });
 
@@ -85,18 +83,15 @@ test('onEvent receives limit/unsafe_default_require_tenant when requireTenantId 
   const events: LogbunEvent[] = [];
   const audit = new AuditLogger({
     namespace: 'unsafe-tenant',
+    reliability: makeFileReliability('unsafe-tenant', dataDir),
     mode: 'durable',
     adapter: okAdapter(),
-    dataDir,
     // requireTenantId omitted
     onEvent: (e) => events.push(e),
-    wal: { fsync: false },
     batching: { maxSize: 100, flushInterval: 60_000 },
     retry: {
       insertMaxRetries: 1,
       insertBaseDelayMs: 1,
-      initialDelayMs: 60_000,
-      scanIntervalMs: 60_000,
     },
   });
 
@@ -122,17 +117,14 @@ test('enterprise defaults suppress both unsafe limit events', async () => {
   const events: LogbunEvent[] = [];
   const audit = new AuditLogger({
     namespace: 'enterprise-def',
+    reliability: makeFileReliability('enterprise-def', dataDir),
     ...ENTERPRISE_DEFAULTS,
     adapter: okAdapter(),
-    dataDir,
     onEvent: (e) => events.push(e),
-    wal: { fsync: false },
     batching: { maxSize: 100, flushInterval: 60_000 },
     retry: {
       insertMaxRetries: 1,
       insertBaseDelayMs: 1,
-      initialDelayMs: 60_000,
-      scanIntervalMs: 60_000,
     },
   });
 
@@ -159,7 +151,6 @@ test('database_per_tenant does not emit unsafe_default_require_tenant', async ()
     namespace: 'unsafe-dpt',
     mode: 'volatile',
     adapter: okAdapter(),
-    dataDir,
     tenancy: {
       mode: 'database_per_tenant',
       resolveConnection: async (tenantId: string) => ({
@@ -172,8 +163,6 @@ test('database_per_tenant does not emit unsafe_default_require_tenant', async ()
     retry: {
       insertMaxRetries: 1,
       insertBaseDelayMs: 1,
-      initialDelayMs: 60_000,
-      scanIntervalMs: 60_000,
     },
   });
 
@@ -203,14 +192,11 @@ test('getStats before ready includes preReadyBuffer in queued', async () => {
     namespace: 'preready-stats',
     mode: 'volatile',
     adapter: okAdapter(200),
-    dataDir,
     requireTenantId: true,
     batching: { maxSize: 100, flushInterval: 60_000 },
     retry: {
       insertMaxRetries: 1,
       insertBaseDelayMs: 1,
-      initialDelayMs: 60_000,
-      scanIntervalMs: 60_000,
     },
   });
 

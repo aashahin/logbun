@@ -1,3 +1,4 @@
+import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -5,7 +6,7 @@ import { join } from 'node:path';
 
 import { Batcher } from '../src/engine/batcher';
 import { ConnectionPool } from '../src/engine/pool';
-import { DLQStorage } from '../src/storage/dlq';
+import { DLQStorage } from '../src/durability/filesystem';
 import type {
   IAdapter,
   LogbunLog,
@@ -76,12 +77,15 @@ test('flush drains oversized queue in bulkInsert chunks of at most maxSize', asy
   const pool = new ConnectionPool(adapter, 5);
   const dlq = new DLQStorage('flush-chunk', dataDir);
   await dlq.init();
+  const rel = makeFileReliability('rel-ns', dataDir);
+  await rel.init();
+  // use underlying if needed — prefer FileReliabilityAdapter alone
+
 
   const batcher = new Batcher({
     adapter,
     pool,
-    wal: null,
-    dlq,
+    reliability: rel,
     mode: 'volatile',
     batching: {
       maxSize,
@@ -124,11 +128,12 @@ test('size-triggered auto-flush still caps each bulkInsert at maxSize', async ()
   const dlq = new DLQStorage('flush-chunk-auto', dataDir);
   await dlq.init();
 
+    const rel = makeFileReliability('flush-chunk-auto', dataDir);
+    await rel.init();
   const batcher = new Batcher({
     adapter,
     pool,
-    wal: null,
-    dlq,
+    reliability: rel,
     mode: 'volatile',
     batching: {
       maxSize,

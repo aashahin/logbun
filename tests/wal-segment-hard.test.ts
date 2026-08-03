@@ -3,7 +3,7 @@ import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { WALStorage } from '../src/storage/wal';
+import { WALStorage } from '../src/durability/filesystem';
 import type { LogbunLog } from '../src/types';
 
 const cleanupPaths: string[] = [];
