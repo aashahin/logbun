@@ -16,7 +16,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
-import { createInterface } from 'node:readline';
+import { Buffer } from 'node:buffer';
 import { join } from 'node:path';
 
 import { access, constants as FsConstants } from 'node:fs/promises';
@@ -55,14 +55,16 @@ export interface WALStorageOptions {
   compactAckThreshold?: number;
   /**
    * Hard size limit in bytes across all segments + current.
-   * When `hardMaxBytes` is true (default), append throws `wal_full` if already at/over limit.
+   * When `hardMaxBytes` is true (default), append throws `wal_full` if the
+   * next fully encoded line would exceed this limit.
    * @default {@link WAL_SIZE_SOFT_LIMIT_BYTES} (64 MiB)
    */
   maxBytes?: number;
   /** Alias for {@link WALStorageOptions.maxBytes}. */
   maxWalBytes?: number;
   /**
-   * When true (default), refuse append once total size >= maxBytes (`wal_full`).
+   * When true (default), refuse an append whose exact encoded bytes would make
+   * the WAL larger than `maxBytes` (`wal_full`). Equality is permitted.
    * Batcher treats this like any WAL append failure (DLQ fallback).
    * @default true
    */
@@ -198,10 +200,14 @@ export class WALStorage {
         throw new Error('WAL not initialized — call init() first');
       }
 
+      const encodedLine = await this.encodeLogLine(log);
+      // Include the separator written by appendFile.  Check after serializing
+      // (and encrypting) so hard limits apply to real bytes on disk.
+      const appendBytes = new TextEncoder().encode(`${encodedLine}\n`).byteLength;
       const total = await this.sizeOfAllUnlocked();
-      if (this.hardMaxBytes && total >= this.maxBytes) {
+      if (this.hardMaxBytes && total + appendBytes > this.maxBytes) {
         throw new Error(
-          `wal_full: WAL size ${total} >= maxBytes ${this.maxBytes}`
+          `wal_full: WAL size ${total} + append ${appendBytes} > maxBytes ${this.maxBytes}`
         );
       }
 
@@ -211,11 +217,7 @@ export class WALStorage {
         await this.rotateCurrentUnlocked();
       }
 
-      const plain = JSON.stringify(log);
-      const line = this.encryptionKey
-        ? await encryptUtf8(plain, this.encryptionKey)
-        : plain;
-      await appendFile(this.path, line + '\n');
+      await appendFile(this.path, encodedLine + '\n');
       if (this.fsync) {
         await this.fsyncFile(this.path);
       }
@@ -231,12 +233,14 @@ export class WALStorage {
     maxLogsOrOpts?: number | WALReadBoundedOptions
   ): Promise<WALReadBoundedResult> {
     let maxLogs: number | undefined;
+    let maxBytes: number | undefined;
     if (typeof maxLogsOrOpts === 'number') {
       maxLogs = maxLogsOrOpts;
     } else if (maxLogsOrOpts && typeof maxLogsOrOpts === 'object') {
       maxLogs = maxLogsOrOpts.maxLogs;
+      maxBytes = maxLogsOrOpts.maxBytes;
     }
-    return this.runExclusive(() => this.readPendingBoundedUnlocked(maxLogs));
+    return this.runExclusive(() => this.readPendingBoundedUnlocked(maxLogs, maxBytes));
   }
 
   async approximateSize(): Promise<number> {
@@ -385,7 +389,8 @@ export class WALStorage {
   }
 
   private async readPendingBoundedUnlocked(
-    maxLogs?: number
+    maxLogs?: number,
+    maxBytes?: number
   ): Promise<WALReadBoundedResult> {
     const approxBytes = await this.sizeOfAllUnlocked();
     const acked = await this.readAckedIdsUnlocked();
@@ -393,16 +398,32 @@ export class WALStorage {
     let truncated = false;
     const hasCap =
       typeof maxLogs === 'number' && Number.isFinite(maxLogs) && maxLogs >= 0;
+    const hasByteCap =
+      typeof maxBytes === 'number' && Number.isFinite(maxBytes) && maxBytes >= 0;
+    let readBytes = 0;
 
     const paths = await this.aofPathsInOrderUnlocked();
     outer: for (const p of paths) {
-      const stop = await this.forEachLogLineUnlocked(p, (log) => {
+      const stop = await this.forEachLogLineUnlocked(p, (log, encodedBytes) => {
         if (acked.has(log.id)) return 'continue';
         if (hasCap && logs.length >= (maxLogs as number)) {
           truncated = true;
           return 'stop';
         }
+        // A single large record is returned so a recovery pump always makes
+        // progress; it also ends this wave so it cannot read without bound.
+        if (hasByteCap && readBytes + encodedBytes > (maxBytes as number)) {
+          if (logs.length > 0) {
+            truncated = true;
+            return 'stop';
+          }
+          logs.push(log);
+          readBytes += encodedBytes;
+          truncated = true;
+          return 'stop';
+        }
         logs.push(log);
+        readBytes += encodedBytes;
         return 'continue';
       });
       if (stop || truncated) break outer;
@@ -417,30 +438,54 @@ export class WALStorage {
    */
   private async forEachLogLineUnlocked(
     filePath: string,
-    onLog: (log: LogbunLog) => 'continue' | 'stop' | void
+    onLog: (log: LogbunLog, encodedBytes: number) => 'continue' | 'stop' | void
   ): Promise<boolean> {
     if (!(await fileExists(filePath))) return false;
 
-    const stream = createReadStream(filePath, { encoding: 'utf8' });
-    const rl = createInterface({ input: stream, crlfDelay: Infinity });
-    try {
-      for await (const rawLine of rl) {
-        const trimmed = rawLine.trim();
-        if (!trimmed) continue;
-        let plain = trimmed;
-        try {
-          if (this.encryptionKey) {
-            plain = await decryptUtf8(trimmed, this.encryptionKey);
-          }
-          const log = JSON.parse(plain) as LogbunLog;
-          if (onLog(log) === 'stop') return true;
-        } catch {
-          // Discard malformed / decrypt failures for partial crash lines
-          continue;
+    const stream = createReadStream(filePath);
+    let carry = Buffer.alloc(0);
+    const processLine = async (rawBytes: Buffer, encodedBytes: number) => {
+      // Tolerate CRLF migration input while preserving its physical byte count.
+      const lineBytes =
+        rawBytes.length > 0 && rawBytes[rawBytes.length - 1] === 0x0d
+          ? rawBytes.subarray(0, rawBytes.length - 1)
+          : rawBytes;
+      const rawLine = lineBytes.toString('utf8');
+      const trimmed = rawLine.trim();
+      if (!trimmed) return false;
+      let plain = trimmed;
+      try {
+        if (this.encryptionKey) {
+          plain = await decryptUtf8(trimmed, this.encryptionKey);
         }
+        const log = JSON.parse(plain) as LogbunLog;
+        if (onLog(log, encodedBytes) === 'stop') return true;
+      } catch {
+        // Discard malformed / decrypt failures for partial crash lines
+      }
+      return false;
+    };
+    try {
+      for await (const chunk of stream) {
+        const incoming = Buffer.from(chunk);
+        const data = carry.length > 0 ? Buffer.concat([carry, incoming]) : incoming;
+        let start = 0;
+        for (;;) {
+          const newline = data.indexOf(0x0a, start);
+          if (newline < 0) break;
+          if (await processLine(data.subarray(start, newline), newline - start + 1)) {
+            return true;
+          }
+          start = newline + 1;
+        }
+        carry = data.subarray(start);
+      }
+      // A crash can leave a complete final JSON record without its newline.
+      // Count only the bytes actually present, not an imagined separator.
+      if (carry.length > 0 && (await processLine(carry, carry.length))) {
+        return true;
       }
     } finally {
-      rl.close();
       stream.destroy();
     }
     return false;
@@ -480,12 +525,7 @@ export class WALStorage {
   private async rewrite(path: string, logs: LogbunLog[]): Promise<void> {
     const lines: string[] = [];
     for (const l of logs) {
-      const plain = JSON.stringify(l);
-      if (this.encryptionKey) {
-        lines.push(await encryptUtf8(plain, this.encryptionKey));
-      } else {
-        lines.push(plain);
-      }
+      lines.push(await this.encodeLogLine(l));
     }
     const body = lines.length === 0 ? '' : lines.join('\n') + '\n';
     const tempPath = `${path}.tmp`;
@@ -494,6 +534,13 @@ export class WALStorage {
       await this.fsyncFile(tempPath);
     }
     await rename(tempPath, path);
+  }
+
+  private async encodeLogLine(log: LogbunLog): Promise<string> {
+    const plain = JSON.stringify(log);
+    return this.encryptionKey
+      ? encryptUtf8(plain, this.encryptionKey)
+      : plain;
   }
 
   private async fsyncFile(filePath: string): Promise<void> {

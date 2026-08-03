@@ -169,6 +169,11 @@ export class CloudflareReliabilityAdapter implements ReliabilityAdapter {
       `CREATE INDEX IF NOT EXISTS idx_${this.prefix}_dlq_state ON ${this.dTable()} (state, created_ms)`
     );
     this.ready = true;
+    // A DO can be reconstructed with rows but no scheduled alarm (for
+    // example, after an isolate restart). Recover an interrupted claim before
+    // looking at pending work, then restore the host maintenance wake-up.
+    await this.recoverOrphans();
+    await this.maybeAlarm();
   }
 
   async close(): Promise<void> {

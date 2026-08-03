@@ -95,9 +95,11 @@ await audit.shutdown();
 ### Durable filesystem (Node / Bun / Deno)
 
 ```typescript
-import { AuditLogger, ENTERPRISE_DEFAULTS } from 'logbun';
+import { AuditLogger, ENTERPRISE_DEFAULTS, type IAdapter } from 'logbun';
 import { FileReliabilityAdapter } from 'logbun/durability/filesystem';
-import { BunSQLiteAdapter } from 'logbun/adapters/bun-sqlite';
+
+// Supply your runtime's destination adapter (Postgres, HTTP collector, etc.).
+declare const destination: IAdapter;
 
 const reliability = new FileReliabilityAdapter({
   namespace: process.env.INSTANCE_ID ?? 'my-app', // unique per replica
@@ -110,7 +112,7 @@ const audit = new AuditLogger({
   ...ENTERPRISE_DEFAULTS, // mode: 'durable', requireTenantId: true
   namespace: 'my-app',
   reliability,
-  adapter: new BunSQLiteAdapter({ path: '.logbun/audit.db' }),
+  adapter: destination,
   redactPaths: ['password', 'token'],
   retention: { days: 90 },
 });
@@ -128,6 +130,9 @@ await audit.shutdown();
 ```
 
 **Deno:** `deno run --allow-read --allow-write=./.logbun app.ts`
+
+For Bun's built-in SQLite destination specifically, import
+`BunSQLiteAdapter` from `logbun/adapters/bun-sqlite` in a Bun-only module.
 
 ### Cloudflare Durable Objects
 

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises';
+import { lstat, mkdtemp, readdir, rm, symlink, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -153,4 +153,95 @@ test('diagnostic DLQ metadata path is not accepted as requeue authority', async 
   expect(typeof diagnosticPath).toBe('string');
   await expect(dlq.requeueDead(String(diagnosticPath))).rejects.toThrow(/id/);
   expect(await dlq.requeueDead(dead!.id)).toBe(id);
+});
+
+test('symlinked batch entries cannot be read, overwritten, or deleted outside the DLQ', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-symlink-'));
+  const outsideDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-symlink-outside-'));
+  cleanupPaths.push(dataDir, outsideDir);
+  const dlq = new DLQStorage('symlink', dataDir);
+  await dlq.init();
+
+  const external = join(outsideDir, 'external.batch');
+  const original = JSON.stringify({
+    v: 2,
+    id: 'linked-processing',
+    tenantId: 'outside',
+    attempts: 0,
+    logs: [makeLog('outside-log', 'outside')],
+  });
+  await writeFile(external, original);
+
+  const processingLink = join(dlq.directory, 'linked-processing.batch.processing');
+  await symlink(external, processingLink);
+  await expect(dlq.setAttempts('linked-processing', 4)).rejects.toThrow(/symbolic link/);
+  expect(await Bun.file(external).text()).toBe(original);
+
+  const pendingLink = join(dlq.directory, 'linked-pending.batch');
+  await symlink(external, pendingLink);
+  await expect(dlq.claim('linked-pending')).rejects.toThrow(/symbolic link/);
+  expect(await Bun.file(external).text()).toBe(original);
+
+  const deadLink = join(dlq.directory, 'linked-dead.batch.dead');
+  await symlink(external, deadLink);
+  await expect(dlq.deleteDead('linked-dead')).rejects.toThrow(/symbolic link/);
+  expect((await lstat(deadLink)).isSymbolicLink()).toBe(true);
+  expect(await Bun.file(external).text()).toBe(original);
+});
+
+test('a symlinked DLQ directory cannot redirect a new write', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-dir-link-'));
+  const outsideDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-dir-link-outside-'));
+  cleanupPaths.push(dataDir, outsideDir);
+  const dlq = new DLQStorage('dir-link', dataDir);
+  await dlq.init();
+
+  await rm(dlq.directory, { recursive: true, force: true });
+  await symlink(outsideDir, dlq.directory);
+  await expect(dlq.write('tenant', [makeLog('must-stay-confined', 'tenant')])).rejects.toThrow(
+    /symbolic link/,
+  );
+  expect(await readdir(outsideDir)).toEqual([]);
+});
+
+test('a symlinked configured data directory is rejected before initialization writes', async () => {
+  const parentDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-data-link-'));
+  const outsideDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-data-link-outside-'));
+  cleanupPaths.push(parentDir, outsideDir);
+  const linkedDataDir = join(parentDir, 'data');
+  await symlink(outsideDir, linkedDataDir);
+
+  const dlq = new DLQStorage('data-link', linkedDataDir);
+  await expect(dlq.init()).rejects.toThrow(/symbolic link/);
+  expect(await readdir(outsideDir)).toEqual([]);
+});
+
+test('a symlink in a configured data-directory segment is rejected', async () => {
+  const parentDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-data-segment-'));
+  const outsideDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-data-segment-outside-'));
+  cleanupPaths.push(parentDir, outsideDir);
+  const safeDir = join(parentDir, 'safe');
+  const linkedSegment = join(safeDir, 'link');
+  const configuredDataDir = join(linkedSegment, 'nested');
+  await mkdir(safeDir);
+  await mkdir(join(outsideDir, 'nested'));
+  await symlink(outsideDir, linkedSegment);
+
+  const dlq = new DLQStorage('nested-link', configuredDataDir);
+  await expect(dlq.init()).rejects.toThrow(/symbolic link/);
+  expect(await readdir(join(outsideDir, 'nested'))).toEqual([]);
+});
+
+test('a symlinked ancestor is rejected before a missing data directory is created', async () => {
+  const parentDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-missing-segment-'));
+  const outsideDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-missing-segment-outside-'));
+  cleanupPaths.push(parentDir, outsideDir);
+  const safeDir = join(parentDir, 'safe');
+  const linkedSegment = join(safeDir, 'link');
+  await mkdir(safeDir);
+  await symlink(outsideDir, linkedSegment);
+
+  const dlq = new DLQStorage('missing-link', join(linkedSegment, 'missing'));
+  await expect(dlq.init()).rejects.toThrow(/symbolic link/);
+  expect(await readdir(outsideDir)).toEqual([]);
 });

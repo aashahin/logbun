@@ -130,3 +130,29 @@ test('write with null tenantId uses global key', async () => {
   // envelope stores null tenantId for global writes
   expect(batch.tenantId).toBeNull();
 });
+
+test('failed retry metadata replacement leaves the processing batch valid', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-atomic-'));
+  cleanupPaths.push(dataDir);
+
+  const dlq = new DLQStorage('dlq-atomic', dataDir, {
+    fsync: true,
+    beforeAtomicRename: async (targetPath) => {
+      if (targetPath.endsWith('.batch.processing')) {
+        throw new Error('simulated crash before rename');
+      }
+    },
+  });
+  await dlq.init();
+  await dlq.write('tenant-a', [makeLog('atomic-1', 'tenant-a')]);
+  const [pending] = await dlq.listPendingPaths();
+  const processing = await dlq.markProcessing(pending!);
+
+  await expect(dlq.incrementAttempts(processing, 0)).rejects.toThrow(
+    /simulated crash before rename/,
+  );
+  const preserved = await readBatch(processing);
+  expect(preserved.attempts).toBe(0);
+  expect(preserved.logs.map((log) => log.id)).toEqual(['atomic-1']);
+  expect((await readdir(dlq.directory)).some((name) => name.endsWith('.tmp'))).toBe(false);
+});

@@ -1,4 +1,4 @@
-import type { IAdapter, LogbunConfig, ReliabilityAdapter } from './types';
+import type { IAdapter, LogbunConfig, LogbunLog, ReliabilityAdapter } from './types';
 import { MemoryReliabilityAdapter } from './reliability/memory';
 import { ConnectionPool } from './engine/pool';
 import { Batcher, type BatcherDeps } from './engine/batcher';
@@ -73,10 +73,19 @@ export async function bootstrap<T extends string>(
 
     // Keep recovered entries durable until flush acknowledges them.
     if (mode === 'durable' && reliability.persistent) {
-      await recoverJournal(reliability, batcher, {
+      const firstRecovery = await recoverJournal(reliability, batcher, {
         maxLogs: config.maxRecoveryBatch ?? maxQueueSize,
         onEvent,
       });
+      if (firstRecovery.truncated) {
+        batcher.setRecoveryLoader(() =>
+          recoverJournal(reliability, batcher, {
+            maxLogs: config.maxRecoveryBatch ?? maxQueueSize,
+            onEvent,
+            inject: false,
+          })
+        );
+      }
     }
 
     await reliability.recoverOrphans();
@@ -117,8 +126,10 @@ async function recoverJournal(
   opts: {
     maxLogs: number;
     onEvent: LogbunEventHandler | undefined;
+    /** Batcher recovery loader injects the returned wave itself. */
+    inject?: boolean;
   }
-): Promise<void> {
+): Promise<{ logs: LogbunLog[]; truncated: boolean }> {
   const { maxLogs, onEvent } = opts;
 
   const result = await reliability.recoverJournal({ maxLogs });
@@ -131,9 +142,11 @@ async function recoverJournal(
     });
   }
 
-  if (result.logs.length > 0) {
-    batcher.injectRecovered(result.logs as import("./types").LogbunLog[]);
+  const logs = result.logs as LogbunLog[];
+  if (opts.inject !== false && logs.length > 0) {
+    batcher.injectRecovered(logs);
   }
+  return { logs, truncated: result.truncated };
 }
 
 export async function runRetentionPrune(opts: {

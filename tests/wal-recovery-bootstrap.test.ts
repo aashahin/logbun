@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { bootstrap } from '../src/bootstrap';
+import { AuditLogger } from '../src/logger';
 import type { IAdapter, LogbunLog, LogbunQueryFilters, LogbunQueryResult } from '../src/types';
 import { WALStorage } from '../src/durability/filesystem';
 import { makeFileReliability } from './helpers';
@@ -83,4 +84,101 @@ test('bootstrap durable recovery keeps WAL until flush acknowledges', async () =
   await engine.batcher.flushAll();
   await engine.pool.closeAll();
   await engine.reliability.close();
+});
+
+test('maintenance drains every bounded filesystem recovery wave without duplicates', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-wal-recovery-waves-'));
+  cleanupPaths.push(dataDir);
+  const seedWal = new WALStorage('waves-ns', dataDir, { fsync: false });
+  await seedWal.init();
+  const ids = Array.from({ length: 6 }, (_, index) => `wave-${index}`);
+  for (const [index, id] of ids.entries()) {
+    await seedWal.append({ ...makeLog(id), tenantId: `tenant-${index % 3}` });
+  }
+  await seedWal.close();
+
+  const inserts: string[] = [];
+  const adapter: IAdapter = {
+    async init() {},
+    async bulkInsert(_tenantId, logs) {
+      inserts.push(...logs.map((log) => log.id));
+      return true;
+    },
+    async query(
+      _t: string | null,
+      _f: LogbunQueryFilters,
+      _p: { cursor?: string; limit: number },
+    ): Promise<LogbunQueryResult> {
+      return { logs: [], nextCursor: null };
+    },
+    async prune() {},
+    async close() {},
+  };
+
+  const engine = await bootstrap({
+    namespace: 'waves-ns',
+    reliability: makeFileReliability('waves-ns', dataDir),
+    mode: 'durable',
+    adapter,
+    maxRecoveryBatch: 2,
+    batching: { maxSize: 10, flushInterval: 60_000, maxQueueSize: 20, onQueueFull: 'dlq' },
+  });
+
+  await engine.batcher.flushAll();
+  expect(inserts.sort()).toEqual(ids);
+  expect(new Set(inserts).size).toBe(ids.length);
+  expect((await engine.reliability.recoverJournal()).logs).toEqual([]);
+
+  engine.retryEngine.stop();
+  await engine.pool.closeAll();
+  await engine.reliability.close();
+});
+
+test('AuditLogger.runMaintenance drains every filesystem recovery wave', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-wal-logger-waves-'));
+  cleanupPaths.push(dataDir);
+  const seedWal = new WALStorage('logger-waves', dataDir, { fsync: false });
+  await seedWal.init();
+  const ids = Array.from({ length: 5 }, (_, index) => `logger-wave-${index}`);
+  for (const [index, id] of ids.entries()) {
+    await seedWal.append({ ...makeLog(id), tenantId: `tenant-${index % 2}` });
+  }
+  await seedWal.close();
+
+  const inserts: string[] = [];
+  const adapter: IAdapter = {
+    async init() {},
+    async bulkInsert(_tenantId, logs) {
+      inserts.push(...logs.map((log) => log.id));
+      return true;
+    },
+    async query(
+      _t: string | null,
+      _f: LogbunQueryFilters,
+      _p: { cursor?: string; limit: number },
+    ): Promise<LogbunQueryResult> {
+      return { logs: [], nextCursor: null };
+    },
+    async prune() {},
+    async close() {},
+  };
+
+  const audit = new AuditLogger({
+    namespace: 'logger-waves',
+    reliability: makeFileReliability('logger-waves', dataDir),
+    mode: 'durable',
+    adapter,
+    maxRecoveryBatch: 2,
+    batching: { maxSize: 10, flushInterval: 60_000, maxQueueSize: 20, onQueueFull: 'dlq' },
+  });
+  await audit.ready;
+  await audit.runMaintenance();
+  expect(inserts.sort()).toEqual(ids);
+  expect(new Set(inserts).size).toBe(ids.length);
+  await audit.shutdown();
+
+  const verify = makeFileReliability('logger-waves', dataDir);
+  await verify.init();
+  expect((await verify.recoverJournal()).logs).toEqual([]);
+  await verify.close();
 });

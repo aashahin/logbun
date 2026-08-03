@@ -67,6 +67,12 @@ export interface BatcherStats {
   inflightFlushes: number;
 }
 
+/** Source for the next durable recovery wave after the current queues drain. */
+export type RecoveryWaveLoader = () => Promise<{
+  logs: LogbunLog[];
+  truncated: boolean;
+}>;
+
 /**
  * Batching Engine — per-tenant in-memory queues with backpressure.
  *
@@ -86,6 +92,10 @@ export class Batcher {
   private readonly flushChains: Map<string, Promise<void>> = new Map();
   /** Remaining WAL recovery logs not yet injected (bounded inject). */
   private recoveryBacklog: LogbunLog[] = [];
+  private recoveryLoader: RecoveryWaveLoader | null = null;
+  private recoverySourceMayHaveMore = false;
+  private recoveryLoad: Promise<boolean> | null = null;
+  private recoveryPumpQueued = false;
 
   private readonly config: BatchingConfig;
   private readonly mode: DurabilityMode;
@@ -328,6 +338,7 @@ export class Batcher {
       }
     } finally {
       this.inflightFlushes--;
+      this.scheduleRecoveryPump();
     }
   }
 
@@ -404,7 +415,10 @@ export class Batcher {
 
       if (this.inflightFlushes === 0) {
         const remaining = [...this.queues.values()].some((q) => q.length > 0);
-        if (!remaining && this.recoveryBacklog.length === 0) break;
+        if (!remaining && this.recoveryBacklog.length === 0) {
+          if (await this.loadRecoveryWave()) continue;
+          break;
+        }
         if (this.recoveryBacklog.length > 0) {
           const before = this.recoveryBacklog.length;
           this.drainRecoveryBacklog(true);
@@ -456,6 +470,17 @@ export class Batcher {
     this.injectWave(first);
   }
 
+  /**
+   * Continue a truncated persistent recovery only after currently recovered
+   * records have been settled. This keeps boot memory bounded and prevents a
+   * second journal read from replaying records that are still in flight.
+   */
+  setRecoveryLoader(loader: RecoveryWaveLoader): void {
+    this.recoveryLoader = loader;
+    this.recoverySourceMayHaveMore = true;
+    this.scheduleRecoveryPump();
+  }
+
   scheduleRecoveredFlush(keys?: Iterable<string>): void {
     const keyList = keys ? [...keys] : [...this.queues.keys()];
     for (const key of keyList) {
@@ -497,17 +522,16 @@ export class Batcher {
     const deferred: LogbunLog[] = [];
     const affected = new Set<string>();
     let totalQueued = this.totalOccupancy();
-    const newKeysThisWave = new Set<string>();
     const maxQueueSize = this.config.maxQueueSize;
 
     for (const key of keyOrder) {
       const recovered = byKey.get(key)!;
-      const hasQueue = this.queues.has(key) || newKeysThisWave.has(key);
+      const hasQueue = this.queues.has(key);
 
       if (!hasQueue) {
-        const active =
-          this.queues.size + newKeysThisWave.size;
-        if (active >= this.maxActiveTenants) {
+        // getOrCreateQueue mutates `queues` immediately, so its current size
+        // is the authoritative count. Do not add a second per-wave count.
+        if (this.queues.size >= this.maxActiveTenants) {
           deferred.push(...recovered);
           continue;
         }
@@ -531,9 +555,6 @@ export class Batcher {
 
       if (accepted.length === 0) continue;
 
-      if (!this.queues.has(key)) {
-        newKeysThisWave.add(key);
-      }
       const queue = this.getOrCreateQueue(key);
       queue.unshift(...accepted);
       affected.add(key);
@@ -567,6 +588,67 @@ export class Batcher {
 
     const wave = this.recoveryBacklog.splice(0, batchSize);
     this.injectWave(wave);
+  }
+
+  private hasQueuedRecoveryWork(): boolean {
+    return [...this.queues.values()].some((queue) => queue.length > 0);
+  }
+
+  private scheduleRecoveryPump(): void {
+    if (
+      !this.recoveryLoader ||
+      !this.recoverySourceMayHaveMore ||
+      this.recoveryPumpQueued
+    ) {
+      return;
+    }
+    this.recoveryPumpQueued = true;
+    queueMicrotask(() => {
+      this.recoveryPumpQueued = false;
+      void this.loadRecoveryWave();
+    });
+  }
+
+  /** Load at most one persisted wave, only when no prior wave is in flight. */
+  private async loadRecoveryWave(): Promise<boolean> {
+    if (
+      !this.recoveryLoader ||
+      !this.recoverySourceMayHaveMore ||
+      this.recoveryBacklog.length > 0 ||
+      this.hasQueuedRecoveryWork() ||
+      this.inflightFlushes > 0
+    ) {
+      return false;
+    }
+    if (this.recoveryLoad) return this.recoveryLoad;
+
+    const run = (async (): Promise<boolean> => {
+      try {
+        const wave = await this.recoveryLoader!();
+        // An empty truncated response cannot make progress; stop rather than
+        // spinning maintenance forever on a broken adapter.
+        this.recoverySourceMayHaveMore =
+          wave.truncated && wave.logs.length > 0;
+        if (wave.logs.length === 0) return false;
+        this.injectRecovered(wave.logs);
+        return true;
+      } catch (error) {
+        this.recoverySourceMayHaveMore = false;
+        this.emit({
+          type: 'flush_fail',
+          count: 0,
+          detail: 'recovery',
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return false;
+      }
+    })();
+    this.recoveryLoad = run;
+    try {
+      return await run;
+    } finally {
+      if (this.recoveryLoad === run) this.recoveryLoad = null;
+    }
   }
 
   private async enqueueDuringShutdown(

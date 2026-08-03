@@ -9,6 +9,7 @@ type StateLike = {
       };
     };
     getAlarm?: () => Promise<number | null>;
+    deleteAlarm?: () => Promise<void>;
   };
 };
 
@@ -74,6 +75,10 @@ export class AuditDO {
       await this.audit.runMaintenance();
       return json(await this.audit.getStatsDetailed());
     }
+    if (url.pathname === '/clear-alarm') {
+      await this.state.storage.deleteAlarm?.();
+      return json({ cleared: true });
+    }
     if (url.pathname === '/recovery') {
       const fresh = new CloudflareReliabilityAdapter({
         state: this.state,
@@ -118,6 +123,17 @@ export class AuditDO {
         attemptsAfterRequeue: requeuedEntry?.attempts,
         deleted: await this.reliability.readDlq(id),
       });
+    }
+    if (url.pathname === '/orphan') {
+      const id = await this.reliability.writeDlq('tenant-a', [{
+        id: randomUUIDv7(),
+        actorId: 'worker-user',
+        action: 'orphan',
+        createdAt: new Date().toISOString(),
+      }]);
+      const claimed = await this.reliability.claimDlq(id);
+      if (!claimed) throw new Error('could not create processing orphan');
+      return json({ id });
     }
     if (url.pathname === '/state') {
       const stats = await this.audit.getStatsDetailed();

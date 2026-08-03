@@ -139,7 +139,7 @@ test('injectRecovered never grows queues beyond maxActiveTenants and backlogs ov
   const stats = batcher.getStats();
   // Hard cap: active queue keys must never exceed maxActiveTenants
   expect(stats.tenants).toBeLessThanOrEqual(maxActive);
-  expect(stats.tenants).toBeGreaterThanOrEqual(1);
+  expect(stats.tenants).toBe(maxActive);
   // Overflow tenants remain in recovery backlog (not dropped)
   expect(stats.recoveryBacklog).toBeGreaterThan(0);
   expect(stats.queued + stats.recoveryBacklog).toBe(recovered.length);

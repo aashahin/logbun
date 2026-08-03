@@ -15,18 +15,19 @@ import {
   type EncryptionKeyBytes,
 } from '../../utils/crypto';
 import { randomUUIDv7 } from '../../utils/uuidv7';
+import { constants as FsConstants } from 'node:fs';
 import {
-  access,
-  constants as FsConstants,
   mkdir,
   open,
+  lstat,
   readdir,
+  realpath,
   rename,
   unlink,
   writeFile,
   readFile,
 } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 /** On-disk DLQ batch envelope (v2 — opaque id). Legacy v1 / bare arrays supported on read. */
 export interface DLQBatchEnvelope {
@@ -50,6 +51,8 @@ export interface DLQStorageOptions {
   maxFiles?: number;
   maxDlqFiles?: number;
   encryptionKey?: EncryptionKeyBytes;
+  /** @internal Test crash-window hook, invoked after temp fsync and before rename. */
+  beforeAtomicRename?: (targetPath: string) => void | Promise<void>;
 }
 
 export const DLQ_MAX_FILES_DEFAULT = 10_000;
@@ -57,15 +60,6 @@ export const DLQ_MAX_FILES_DEFAULT = 10_000;
 const ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Current UUIDv7 IDs plus confined legacy opaque IDs, never filesystem paths. */
 const OPAQUE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
-
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await access(path, FsConstants.F_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Parse DLQ file content.
@@ -166,10 +160,13 @@ export async function readBatch(
 }
 
 export class DLQStorage {
+  private readonly dataDir: string;
+  private readonly namespaceDir: string;
   private readonly dir: string;
   private readonly fsync: boolean;
   private readonly maxFiles: number;
   private readonly encryptionKey?: EncryptionKeyBytes;
+  private readonly beforeAtomicRename?: (targetPath: string) => void | Promise<void>;
   private writeChain: Promise<void> = Promise.resolve();
 
   constructor(
@@ -178,11 +175,14 @@ export class DLQStorage {
     options?: DLQStorageOptions
   ) {
     const root = resolveLogbunDir(namespace, dataDir);
+    this.dataDir = resolve(dirname(root));
+    this.namespaceDir = resolve(root);
     this.dir = join(root, 'dlq');
     this.fsync = options?.fsync ?? false;
     this.maxFiles =
       options?.maxFiles ?? options?.maxDlqFiles ?? DLQ_MAX_FILES_DEFAULT;
     this.encryptionKey = options?.encryptionKey;
+    this.beforeAtomicRename = options?.beforeAtomicRename;
   }
 
   private runWriteExclusive<T>(fn: () => Promise<T>): Promise<T> {
@@ -203,7 +203,10 @@ export class DLQStorage {
   }
 
   async init(): Promise<void> {
+    await this.assertExistingDataDirAncestor();
+    await this.assertStorageSegments(true);
     await mkdir(this.dir, { recursive: true });
+    await this.assertSecureDirectory();
   }
 
   async countByKind(): Promise<{
@@ -212,6 +215,7 @@ export class DLQStorage {
     dead: number;
     total: number;
   }> {
+    await this.assertSecureDirectory();
     let entries: string[];
     try {
       entries = await readdir(this.dir);
@@ -223,6 +227,8 @@ export class DLQStorage {
     let processing = 0;
     let dead = 0;
     for (const f of entries) {
+      const path = join(this.dir, f);
+      if (!(await this.isSafeRegularFile(path))) continue;
       if (f.endsWith('.batch.processing')) processing++;
       else if (f.endsWith('.batch.dead')) dead++;
       else if (f.endsWith('.batch')) pending++;
@@ -277,18 +283,203 @@ export class DLQStorage {
     }
   }
 
+  /** Reject any configured storage segment that has become a symbolic link. */
+  private async assertExistingDataDirAncestor(): Promise<void> {
+    let candidate = this.dataDir;
+    for (;;) {
+      try {
+        const info = await lstat(candidate);
+        if (info.isSymbolicLink()) {
+          throw new Error('DLQ data directory contains a symbolic link segment');
+        }
+        const physical = await realpath(candidate);
+        if (physical !== candidate) {
+          throw new Error('DLQ data directory contains a symbolic link segment');
+        }
+        return;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') {
+          const parent = dirname(candidate);
+          if (parent === candidate) return;
+          candidate = parent;
+          continue;
+        }
+        // Deno may grant the configured (currently missing) data directory
+        // without granting metadata reads on its parent. mkdir is then still
+        // permission-confined and the post-create physical check below runs.
+        if (code === 'ERR_DENO_NOT_CAPABLE' || (error as Error).name === 'NotCapable') {
+          return;
+        }
+        throw error;
+      }
+    }
+  }
+
+  private async assertStorageSegments(allowMissing = false): Promise<void> {
+    for (const [path, label] of [
+      [this.dataDir, 'data directory'],
+      [this.namespaceDir, 'namespace directory'],
+      [resolve(this.dir), 'DLQ storage directory'],
+    ] as const) {
+      try {
+        const info = await lstat(path);
+        if (info.isSymbolicLink()) {
+          throw new Error(`DLQ ${label} must not be a symbolic link`);
+        }
+        const physical = await realpath(path);
+        if (physical !== path) {
+          throw new Error(`DLQ ${label} contains a symbolic link segment`);
+        }
+      } catch (error) {
+        if (allowMissing && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
+  /** Reject a symlinked DLQ directory before any file operation. */
+  private async assertSecureDirectory(): Promise<string> {
+    const resolvedDir = resolve(this.dir);
+    await this.assertStorageSegments();
+    const info = await lstat(resolvedDir);
+    if (info.isSymbolicLink()) {
+      throw new Error('DLQ storage directory must not be a symbolic link');
+    }
+    if (!info.isDirectory()) {
+      throw new Error('DLQ storage path is not a directory');
+    }
+    return realpath(resolvedDir);
+  }
+
+  /** Physical containment check for an existing DLQ batch. */
+  private async assertSecureExistingFile(path: string): Promise<void> {
+    this.assertUnderDir(path);
+    const root = await this.assertSecureDirectory();
+    const info = await lstat(path);
+    if (info.isSymbolicLink()) {
+      throw new Error('DLQ batch entry must not be a symbolic link');
+    }
+    if (!info.isFile()) {
+      throw new Error('DLQ batch entry is not a regular file');
+    }
+    const physical = await realpath(path);
+    const rel = relative(root, physical);
+    if (rel.startsWith('..') || isAbsolute(rel)) {
+      throw new Error('DLQ batch escaped storage directory');
+    }
+  }
+
+  /** Physical containment check for a file that may be atomically replaced. */
+  private async assertSecureWriteTarget(path: string): Promise<void> {
+    this.assertUnderDir(path);
+    await this.assertSecureDirectory();
+    try {
+      await this.assertSecureExistingFile(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+
+  private async isSafeRegularFile(path: string): Promise<boolean> {
+    try {
+      await this.assertSecureExistingFile(path);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      // Listings must never follow an attacker-controlled link. Explicit ID
+      // operations call assertSecureExistingFile and report the rejection.
+      if (String(error).includes('symbolic link')) return false;
+      throw error;
+    }
+  }
+
+  private async fsyncDirectory(): Promise<void> {
+    try {
+      const fh = await open(this.dir, 'r');
+      try {
+        await fh.sync();
+      } finally {
+        await fh.close();
+      }
+    } catch (error) {
+      // Directory fsync is unavailable on a few supported filesystem/runtime
+      // combinations. Other errors mean the requested durability was not met.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (!['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'EPERM'].includes(code ?? '')) {
+        throw error;
+      }
+    }
+  }
+
+  private async renameSecurely(from: string, to: string): Promise<void> {
+    await this.assertSecureExistingFile(from);
+    await this.assertSecureWriteTarget(to);
+    await rename(from, to);
+    if (this.fsync) await this.fsyncDirectory();
+  }
+
+  private async unlinkSecurely(path: string): Promise<void> {
+    await this.assertSecureExistingFile(path);
+    await unlink(path);
+    if (this.fsync) await this.fsyncDirectory();
+  }
+
   private async writeFileBody(path: string, body: string): Promise<void> {
     const payload = this.encryptionKey
       ? await encryptUtf8(body, this.encryptionKey)
       : body;
-    await writeFile(path, payload, 'utf8');
-    if (this.fsync) {
-      await this.fsyncFile(path);
+    await this.assertSecureWriteTarget(path);
+    let tempPath: string | null = null;
+    try {
+      // `wx` gives the temporary file exclusive creation semantics. It cannot
+      // follow a pre-created symlink and a collision simply gets another UUID.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const candidate = join(
+          this.dir,
+          `.${idFromFilename(path) ?? randomUUIDv7()}.${randomUUIDv7()}.tmp`
+        );
+        try {
+          await writeFile(candidate, payload, { encoding: 'utf8', flag: 'wx' });
+          tempPath = candidate;
+          break;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+      }
+      if (!tempPath) {
+        throw new Error('DLQ could not create a unique temporary batch file');
+      }
+      if (this.fsync) await this.fsyncFile(tempPath);
+      await this.beforeAtomicRename?.(path);
+      await rename(tempPath, path);
+      if (this.fsync) await this.fsyncDirectory();
+    } catch (error) {
+      if (tempPath) await unlink(tempPath).catch(() => undefined);
+      throw error;
     }
   }
 
   async readBatchFile(path: string): Promise<ParsedDLQBatch> {
-    return readBatch(path, this.encryptionKey);
+    await this.assertSecureExistingFile(path);
+    // O_NOFOLLOW closes the check-to-use window for an entry that is swapped
+    // to a symlink after physical validation but before its body is read.
+    const fh = await open(path, FsConstants.O_RDONLY | FsConstants.O_NOFOLLOW);
+    try {
+      const info = await fh.stat();
+      if (!info.isFile()) {
+        throw new Error('DLQ batch entry is not a regular file');
+      }
+      let content = await fh.readFile({ encoding: 'utf8' });
+      if (this.encryptionKey) {
+        content = await decryptUtf8(content.trim(), this.encryptionKey);
+      }
+      return parseBatch(content, idFromFilename(path));
+    } finally {
+      await fh.close();
+    }
   }
 
   /** Resolve opaque id → absolute path for any state, or null. */
@@ -303,9 +494,16 @@ export class DLQStorage {
     ];
     for (const c of candidates) {
       const path = join(this.dir, `${id}${c.suffix}`);
-      if (await fileExists(path)) {
-        return { path, state: c.state };
+      try {
+        // lstat deliberately precedes every ID-resolved operation: `access`
+        // and `stat` would follow an attacker-controlled symbolic link.
+        await lstat(path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
       }
+      await this.assertSecureExistingFile(path);
+      return { path, state: c.state };
     }
     return null;
   }
@@ -452,7 +650,7 @@ export class DLQStorage {
       const newPath = this.pathFor(stableId, 'pending');
       this.assertUnderDir(newPath);
       await this.writeFileBody(newPath, JSON.stringify(envelope));
-      await unlink(resolved.path);
+      await this.unlinkSecurely(resolved.path);
       return stableId;
     });
   }
@@ -472,20 +670,24 @@ export class DLQStorage {
       throw new Error('deleteDead expects a dead DLQ entry id');
     }
     this.assertUnderDir(resolved.path);
-    await unlink(resolved.path);
+    await this.unlinkSecurely(resolved.path);
   }
 
   private async listPathsBySuffix(suffix: string): Promise<string[]> {
+    await this.assertSecureDirectory();
     let entries: string[];
     try {
       entries = await readdir(this.dir);
     } catch {
       return [];
     }
-    return entries
-      .filter((f) => f.endsWith(suffix))
-      .sort()
-      .map((f) => join(this.dir, f));
+    const out: string[] = [];
+    for (const f of entries.sort()) {
+      if (!f.endsWith(suffix)) continue;
+      const path = join(this.dir, f);
+      if (await this.isSafeRegularFile(path)) out.push(path);
+    }
+    return out;
   }
 
   /**
@@ -516,7 +718,7 @@ export class DLQStorage {
       const processingPath = this.pathFor(claimId, 'processing');
       this.assertUnderDir(processingPath);
       try {
-        await rename(pendingPath, processingPath);
+        await this.renameSecurely(pendingPath, processingPath);
       } catch {
         return null;
       }
@@ -532,7 +734,7 @@ export class DLQStorage {
     if (!id) throw new Error('invalid DLQ path');
     const processingPath = this.pathFor(id, 'processing');
     this.assertUnderDir(processingPath);
-    await rename(filePath, processingPath);
+    await this.renameSecurely(filePath, processingPath);
     return processingPath;
   }
 
@@ -542,14 +744,14 @@ export class DLQStorage {
       // try as path
       try {
         this.assertUnderDir(idOrPath);
-        await unlink(idOrPath);
+        await this.unlinkSecurely(idOrPath);
       } catch {
         /* ignore */
       }
       return;
     }
     this.assertUnderDir(resolved.path);
-    await unlink(resolved.path);
+    await this.unlinkSecurely(resolved.path);
   }
 
   async markFailed(idOrPath: string): Promise<void> {
@@ -560,7 +762,7 @@ export class DLQStorage {
         const id = idFromFilename(idOrPath);
         if (!id) throw new Error('invalid processing path');
         const original = this.pathFor(id, 'pending');
-        await rename(idOrPath, original);
+        await this.renameSecurely(idOrPath, original);
       }
       return;
     }
@@ -568,7 +770,7 @@ export class DLQStorage {
     const pending = this.pathFor(id, 'pending');
     this.assertUnderDir(resolved.path);
     this.assertUnderDir(pending);
-    await rename(resolved.path, pending);
+    await this.renameSecurely(resolved.path, pending);
   }
 
   async incrementAttempts(
@@ -613,7 +815,7 @@ export class DLQStorage {
       const deadPath = this.pathFor(id, 'dead');
       this.assertUnderDir(resolved.path);
       this.assertUnderDir(deadPath);
-      await rename(resolved.path, deadPath);
+      await this.renameSecurely(resolved.path, deadPath);
       return;
     }
     if (idOrPath.endsWith('.processing')) {
@@ -621,11 +823,12 @@ export class DLQStorage {
       const id = idFromFilename(idOrPath);
       if (!id) throw new Error('invalid processing path');
       const deadPath = this.pathFor(id, 'dead');
-      await rename(idOrPath, deadPath);
+      await this.renameSecurely(idOrPath, deadPath);
     }
   }
 
   async recoverOrphans(): Promise<void> {
+    await this.assertSecureDirectory();
     let entries: string[];
     try {
       entries = await readdir(this.dir);
@@ -639,7 +842,7 @@ export class DLQStorage {
       const id = idFromFilename(processingPath);
       if (!id) continue;
       const batchPath = this.pathFor(id, 'pending');
-      await rename(processingPath, batchPath);
+      await this.renameSecurely(processingPath, batchPath);
     }
   }
 }
