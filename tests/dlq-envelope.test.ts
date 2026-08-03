@@ -187,7 +187,9 @@ test('init heals a crash after requeue link without creating duplicate delivery'
     dev: pendingInfo.dev,
     ino: pendingInfo.ino,
   });
-  expect((await dlq.readBatchFile(deadPath)).attempts).toBe(0);
+  // Raw exported file parsing remains available for crash-forensics tests;
+  // the storage method itself settles state before returning deliverable data.
+  expect((await readBatch(deadPath)).attempts).toBe(0);
   expect(await dlq.listPending()).toEqual([id]);
   expect(await dlq.listDead()).toEqual([]);
   await expect(lstat(deadPath)).rejects.toThrow();
@@ -227,9 +229,12 @@ test('post-link directory sync failure blocks delivery until repair durability s
   const entries = await readdir(dlq.directory);
   expect(entries).toContain(`${id}.batch`);
   expect(entries).toContain(`${id}.batch.dead`);
+  const pendingPath = join(dlq.directory, `${id}.batch`);
 
   await expect(dlq.recoverOrphans()).rejects.toThrow(/post-link directory sync failure/);
   await expect(dlq.listPending()).rejects.toThrow(/post-link directory sync failure/);
+  await expect(dlq.readBatchFile(pendingPath)).rejects.toThrow(/post-link directory sync failure/);
+  await expect(dlq.readById(id)).rejects.toThrow(/post-link directory sync failure/);
   await expect(dlq.claim(id)).rejects.toThrow(/post-link directory sync failure/);
   await expect(dlq.requeueDead(id)).rejects.toThrow(/post-link directory sync failure/);
 
@@ -242,7 +247,130 @@ test('post-link directory sync failure blocks delivery until repair durability s
   await expect(dlq.requeueDead(id)).rejects.toThrow(/expects a dead DLQ entry id/);
 });
 
-test('delivery listing fails closed while a linked requeue transition is still running', async () => {
+test('an older repair settlement cannot clear a newer failed requeue durability debt', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-requeue-overlap-'));
+  cleanupPaths.push(dataDir);
+
+  let firstId = '';
+  let secondId = '';
+  let crashFirstAfterLink = false;
+  let pauseOldRepairSync = false;
+  let oldRepairPaused = false;
+  let releaseOldRepair!: () => void;
+  const oldRepairMayFinish = new Promise<void>((resolve) => {
+    releaseOldRepair = resolve;
+  });
+  let signalOldRepairPaused!: () => void;
+  const oldRepairReachedSync = new Promise<void>((resolve) => {
+    signalOldRepairPaused = resolve;
+  });
+  let signalSecondLinkStarted!: () => void;
+  const secondLinkStarted = new Promise<void>((resolve) => {
+    signalSecondLinkStarted = resolve;
+  });
+  let observeQueuedOperation = false;
+  let queuedBehindOlderSettlement: boolean | undefined;
+  let signalQueuedOperation!: () => void;
+  const queuedOperationObserved = new Promise<void>((resolve) => {
+    signalQueuedOperation = resolve;
+  });
+  let secondLinkSyncArmed = false;
+  let secondLinkSyncFailed = false;
+  let oldListingFinished = false;
+  let keepFailingRepairSync = true;
+
+  const dlq = new DLQStorage('dlq-requeue-overlap', dataDir, {
+    fsync: true,
+    operationQueued: (queuedBehindPriorOperation) => {
+      if (!observeQueuedOperation || queuedBehindOlderSettlement !== undefined) return;
+      queuedBehindOlderSettlement = queuedBehindPriorOperation;
+      signalQueuedOperation();
+    },
+    beforeRequeueLink: (deadPath) => {
+      if (secondId && deadPath.endsWith(`${secondId}.batch.dead`)) {
+        secondLinkSyncArmed = true;
+        signalSecondLinkStarted();
+      }
+    },
+    afterRequeueLink: (deadPath) => {
+      if (crashFirstAfterLink && deadPath.endsWith(`${firstId}.batch.dead`)) {
+        crashFirstAfterLink = false;
+        throw new Error('simulated first requeue crash after link');
+      }
+    },
+    directorySync: async () => {
+      if (pauseOldRepairSync && !oldRepairPaused) {
+        oldRepairPaused = true;
+        signalOldRepairPaused();
+        await oldRepairMayFinish;
+        return;
+      }
+      if (secondLinkSyncArmed && !secondLinkSyncFailed) {
+        secondLinkSyncFailed = true;
+        const error = new Error('simulated newer post-link sync failure') as NodeJS.ErrnoException;
+        error.code = 'EIO';
+        throw error;
+      }
+      // On the buggy interleaving this is the stale settlement's final sync.
+      // It succeeds, then incorrectly clears the newer repair debt.
+      if (secondLinkSyncFailed && !oldListingFinished) return;
+      if (secondLinkSyncFailed && keepFailingRepairSync) {
+        const error = new Error('simulated retained repair sync failure') as NodeJS.ErrnoException;
+        error.code = 'EIO';
+        throw error;
+      }
+    },
+  });
+  await dlq.init();
+
+  firstId = await dlq.write('tenant-a', [makeLog('older-repair', 'tenant-a')]);
+  secondId = await dlq.write('tenant-a', [makeLog('newer-repair', 'tenant-a')]);
+  for (const id of [firstId, secondId]) {
+    await dlq.claim(id);
+    await dlq.markPoisoned(id);
+  }
+
+  crashFirstAfterLink = true;
+  await expect(dlq.requeueDead(firstId)).rejects.toThrow(/first requeue crash/);
+
+  pauseOldRepairSync = true;
+  const olderSettlement = dlq.listPending().finally(() => {
+    oldListingFinished = true;
+  });
+  await oldRepairReachedSync;
+
+  observeQueuedOperation = true;
+  const newerRequeue = dlq.requeueDead(secondId);
+  await queuedOperationObserved;
+  if (!queuedBehindOlderSettlement) {
+    // An unserialized implementation reaches the second link while the older
+    // settlement remains paused, reproducing the stale debt-clear ordering.
+    await secondLinkStarted;
+    await expect(newerRequeue).rejects.toThrow(/newer post-link sync failure/);
+    releaseOldRepair();
+  } else {
+    releaseOldRepair();
+    await expect(newerRequeue).rejects.toThrow(/newer post-link sync failure/);
+  }
+  await expect(olderSettlement).resolves.toContain(firstId);
+  expect(queuedBehindOlderSettlement).toBe(true);
+
+  await expect(dlq.listPending()).rejects.toThrow(/retained repair sync failure/);
+  await expect(dlq.listDead()).rejects.toThrow(/retained repair sync failure/);
+  await expect(dlq.claim(secondId)).rejects.toThrow(/retained repair sync failure/);
+  await expect(dlq.recoverOrphans()).rejects.toThrow(/retained repair sync failure/);
+  await expect(dlq.requeueDead(secondId)).rejects.toThrow(/retained repair sync failure/);
+
+  keepFailingRepairSync = false;
+  await expect(dlq.recoverOrphans()).resolves.toBeUndefined();
+  expect(await dlq.listPending()).toEqual([firstId, secondId].sort());
+  expect(await dlq.listDead()).toEqual([]);
+  expect(await dlq.claim(secondId)).not.toBeNull();
+  expect(await dlq.claim(secondId)).toBeNull();
+  await expect(dlq.requeueDead(secondId)).rejects.toThrow(/expects a dead DLQ entry id/);
+});
+
+test('delivery listing waits while a linked requeue transition is still running', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-requeue-in-flight-'));
   cleanupPaths.push(dataDir);
   let signalLinked!: () => void;
@@ -253,8 +381,19 @@ test('delivery listing fails closed while a linked requeue transition is still r
   const mayFinish = new Promise<void>((resolve) => {
     finishRequeue = resolve;
   });
+  let observeQueuedOperation = false;
+  let listingQueuedBehindRequeue: boolean | undefined;
+  let signalListingQueued!: () => void;
+  const listingQueued = new Promise<void>((resolve) => {
+    signalListingQueued = resolve;
+  });
   const dlq = new DLQStorage('dlq-requeue-in-flight', dataDir, {
     fsync: true,
+    operationQueued: (queuedBehindPriorOperation) => {
+      if (!observeQueuedOperation || listingQueuedBehindRequeue !== undefined) return;
+      listingQueuedBehindRequeue = queuedBehindPriorOperation;
+      signalListingQueued();
+    },
     afterRequeueLink: async () => {
       signalLinked();
       await mayFinish;
@@ -267,10 +406,13 @@ test('delivery listing fails closed while a linked requeue transition is still r
 
   const requeue = dlq.requeueDead(id);
   await linked;
-  await expect(dlq.listPending()).rejects.toThrow(/requeue transition is in progress/);
+  observeQueuedOperation = true;
+  const listing = dlq.listPending();
+  await listingQueued;
+  expect(listingQueuedBehindRequeue).toBe(true);
   finishRequeue();
   await expect(requeue).resolves.toBe(id);
-  expect(await dlq.listPending()).toEqual([id]);
+  await expect(listing).resolves.toEqual([id]);
   expect(await dlq.listDead()).toEqual([]);
 });
 

@@ -125,7 +125,8 @@ export class WALStorage {
   private readonly segmentBytes: number;
   private readonly encryptionKey?: EncryptionKeyBytes;
   private readonly directorySync?: WALStorageOptions['directorySync'];
-  private readonly createdHierarchyStart?: string;
+  private readonly providedHierarchyStart?: string;
+  private createdDirectoryStart?: string;
   private pendingDirectorySyncs: PendingDirectorySync[] = [];
   private ready = false;
   private pendingAckCount = 0;
@@ -156,7 +157,7 @@ export class WALStorage {
     );
     this.encryptionKey = options?.encryptionKey;
     this.directorySync = options?.directorySync;
-    this.createdHierarchyStart = options?.createdHierarchyStart
+    this.providedHierarchyStart = options?.createdHierarchyStart
       ? resolve(options.createdHierarchyStart)
       : undefined;
   }
@@ -167,6 +168,11 @@ export class WALStorage {
 
   get walDir(): string {
     return this.dir;
+  }
+
+  /** @internal Earliest directory created while preparing the WAL hierarchy. */
+  get createdHierarchyStart(): string | undefined {
+    return this.providedHierarchyStart ?? this.createdDirectoryStart;
   }
 
   private runExclusive<T>(fn: () => Promise<T>): Promise<T> {
@@ -367,6 +373,7 @@ export class WALStorage {
     await assertNoSymlinkPath(this.namespaceDir, 'WAL namespace path');
     await assertNoSymlinkPath(this.dir, 'WAL directory path');
     const walCreatedHierarchyStart = await mkdir(this.dir, { recursive: true });
+    this.createdDirectoryStart ??= walCreatedHierarchyStart;
     await this.assertSecureDirectory();
     const retried = await this.retryPendingDirectorySync();
     const currentCreated = await this.ensureSecureFile(this.path);
@@ -383,7 +390,7 @@ export class WALStorage {
     }
 
     const dataDir = dirname(this.namespaceDir);
-    const createdStart = this.createdHierarchyStart ?? walCreatedHierarchyStart;
+    const createdStart = this.providedHierarchyStart ?? this.createdDirectoryStart;
     const outermostTarget = createdStart
       ? dirname(resolve(createdStart))
       : dirname(dataDir);

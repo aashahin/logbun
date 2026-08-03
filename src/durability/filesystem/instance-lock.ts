@@ -16,13 +16,14 @@
  *
  * Deno: requires path-scoped `--allow-read` / `--allow-write` on the data
  * directory; `--allow-run` is not required because unknown PID-probe failures
- * are treated as potentially alive.
+ * are treated as potentially alive for the bounded recovery-claim lease.
  */
 
-import { open as fsOpen, unlink, mkdir, lstat } from 'node:fs/promises';
+import { open as fsOpen, link, unlink, mkdir, lstat } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { resolveLogbunDir } from './path';
+import { randomUUIDv7 } from '../../utils/uuidv7';
 
 export class InstanceLockError extends Error {
   constructor(message: string) {
@@ -36,10 +37,27 @@ export interface InstanceLockOptions {
   killProcess?: (pid: number, signal: 0) => unknown;
   /** @internal Deterministic metadata write/fsync seam for tests. */
   writeMetadata?: (handle: FileHandle, metadata: string) => void | Promise<void>;
+  /** @internal Deterministic recovery-claim metadata write/fsync seam. */
+  writeRecoveryMetadata?: (
+    handle: FileHandle,
+    metadata: string,
+  ) => void | Promise<void>;
+  /** Age after which malformed legacy recovery claims may be reclaimed. */
+  recoveryClaimStaleMs?: number;
+  /** Bounded lease after which even a potentially-live claim may be replaced. */
+  recoveryClaimLeaseMs?: number;
+  /** @internal Deterministic clock seam for legacy-claim aging tests. */
+  now?: () => number;
+  /** @internal Process-start identity seam; null/throw means unverifiable. */
+  readProcessStartTimeMs?: (
+    pid: number,
+  ) => number | null | Promise<number | null>;
   /** @internal Barrier after ESRCH and before atomic stale-recovery claim. */
   afterStaleProbe?: () => void | Promise<void>;
   /** @internal Adversarial replacement seam after identity check, before unlink. */
   beforeOwnedUnlink?: (path: string) => void | Promise<void>;
+  /** @internal Barrier after a stale main lock has been removed under a claim. */
+  afterStaleMainRemoved?: () => void | Promise<void>;
 }
 
 interface LockIdentity {
@@ -52,20 +70,44 @@ interface RecoveryClaim {
   identity: LockIdentity;
 }
 
-function pidAlive(
+interface LockOwnerMetadata {
+  pid: number;
+  processStartTimeMs: number | null;
+}
+
+interface RecoveryClaimMetadata {
+  v: 1;
+  pid: number;
+  processStartTimeMs: number;
+  claimedAtMs?: number;
+}
+
+function probePidLiveness(
   pid: number,
   killProcess: NonNullable<InstanceLockOptions['killProcess']>,
-): boolean {
-  if (!Number.isFinite(pid) || pid <= 0) return false;
+): 'alive' | 'dead' | 'unknown' {
+  if (!Number.isFinite(pid) || pid <= 0) return 'dead';
   try {
     killProcess(pid, 0);
-    return true;
+    return 'alive';
   } catch (err) {
     const code =
       err && typeof err === 'object' && 'code' in err
         ? (err as { code?: string }).code
         : undefined;
-    return code !== 'ESRCH';
+    return code === 'ESRCH' ? 'dead' : 'unknown';
+  }
+}
+
+async function readLinuxProcessStartTimeMs(pid: number): Promise<number | null> {
+  if (process.platform !== 'linux') return null;
+  try {
+    // Linux procfs timestamps the per-process directory at process creation.
+    // Runtimes without permission to inspect /proc fall through to fail-closed.
+    const info = await lstat(`/proc/${pid}`);
+    return Number.isFinite(info.ctimeMs) ? info.ctimeMs : null;
+  } catch {
+    return null;
   }
 }
 
@@ -75,17 +117,66 @@ function parseLockPid(raw: string): number | null {
   return Number.isFinite(pid) && pid > 0 ? pid : null;
 }
 
+function parseLockOwner(raw: string): LockOwnerMetadata | null {
+  const lines = raw.trim().split(/\r?\n/);
+  const pid = parseLockPid(raw);
+  if (pid === null) return null;
+  const start = Number(lines[1]);
+  return {
+    pid,
+    processStartTimeMs: Number.isFinite(start) && start > 0 ? start : null,
+  };
+}
+
+function parseRecoveryClaim(raw: string): RecoveryClaimMetadata | null {
+  try {
+    const parsed = JSON.parse(raw) as Partial<RecoveryClaimMetadata>;
+    if (
+      parsed.v !== 1 ||
+      !Number.isFinite(parsed.pid) ||
+      parsed.pid! <= 0 ||
+      !Number.isFinite(parsed.processStartTimeMs) ||
+      parsed.processStartTimeMs! < 0
+    ) {
+      return null;
+    }
+    return {
+      v: 1,
+      pid: parsed.pid!,
+      processStartTimeMs: parsed.processStartTimeMs!,
+      claimedAtMs:
+        Number.isFinite(parsed.claimedAtMs) && parsed.claimedAtMs! >= 0
+          ? parsed.claimedAtMs
+          : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function processStartTimeMs(): number {
   return Math.floor(Date.now() - process.uptime() * 1000);
 }
+
+const CURRENT_PROCESS_START_TIME_MS = processStartTimeMs();
 
 export class InstanceLock {
   private readonly path: string;
   private readonly recoveryPath: string;
   private readonly killProcess: NonNullable<InstanceLockOptions['killProcess']>;
   private readonly writeMetadata: NonNullable<InstanceLockOptions['writeMetadata']>;
+  private readonly writeRecoveryMetadata: NonNullable<
+    InstanceLockOptions['writeRecoveryMetadata']
+  >;
+  private readonly recoveryClaimStaleMs: number;
+  private readonly recoveryClaimLeaseMs: number;
+  private readonly now: NonNullable<InstanceLockOptions['now']>;
+  private readonly readProcessStartTimeMs: NonNullable<
+    InstanceLockOptions['readProcessStartTimeMs']
+  >;
   private readonly afterStaleProbe?: InstanceLockOptions['afterStaleProbe'];
   private readonly beforeOwnedUnlink?: InstanceLockOptions['beforeOwnedUnlink'];
+  private readonly afterStaleMainRemoved?: InstanceLockOptions['afterStaleMainRemoved'];
   private handle: FileHandle | null = null;
   private ownedIdentity: LockIdentity | null = null;
   private createdDirectoryStart: string | undefined;
@@ -103,8 +194,21 @@ export class InstanceLock {
       await handle.writeFile(metadata, 'utf8');
       await handle.sync();
     });
+    this.writeRecoveryMetadata = options?.writeRecoveryMetadata ?? (async (handle, metadata) => {
+      await handle.writeFile(metadata, 'utf8');
+      await handle.sync();
+    });
+    this.recoveryClaimStaleMs = Math.max(0, options?.recoveryClaimStaleMs ?? 60_000);
+    this.recoveryClaimLeaseMs = Math.max(
+      1,
+      options?.recoveryClaimLeaseMs ?? this.recoveryClaimStaleMs,
+    );
+    this.now = options?.now ?? Date.now;
+    this.readProcessStartTimeMs =
+      options?.readProcessStartTimeMs ?? readLinuxProcessStartTimeMs;
     this.afterStaleProbe = options?.afterStaleProbe;
     this.beforeOwnedUnlink = options?.beforeOwnedUnlink;
+    this.afterStaleMainRemoved = options?.afterStaleMainRemoved;
   }
 
   get lockPath(): string {
@@ -154,29 +258,147 @@ export class InstanceLock {
     }
   }
 
-  private async acquireRecoveryClaim(): Promise<RecoveryClaim> {
-    let handle: FileHandle;
+  private async isOwnerAlive(owner: LockOwnerMetadata): Promise<boolean> {
+    if (
+      owner.pid === process.pid &&
+      owner.processStartTimeMs === CURRENT_PROCESS_START_TIME_MS
+    ) {
+      return true;
+    }
+    const liveness = probePidLiveness(owner.pid, this.killProcess);
+    if (liveness === 'dead') return false;
+    if (liveness === 'unknown' || owner.processStartTimeMs === null) return true;
     try {
-      handle = await fsOpen(this.recoveryPath, 'wx');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      const observedStart = await this.readProcessStartTimeMs(owner.pid);
+      if (observedStart === null || !Number.isFinite(observedStart)) return true;
+      // Wall-clock process starts derived by different runtimes/filesystems can
+      // differ slightly. A material mismatch identifies PID reuse.
+      return Math.abs(observedStart - owner.processStartTimeMs) <= 5_000;
+    } catch {
+      return true;
+    }
+  }
+
+  private async assertRecoveryClaimOwned(claim: RecoveryClaim): Promise<void> {
+    try {
+      const current = await lstat(this.recoveryPath, { bigint: true });
+      if (current.dev !== claim.identity.dev || current.ino !== claim.identity.ino) {
         throw new InstanceLockError(
-          `instance_lock_held: stale recovery is already in progress for ${this.path}`,
+          `instance_lock_held: recovery ownership changed for ${this.path}`,
+        );
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new InstanceLockError(
+          `instance_lock_held: recovery ownership was lost for ${this.path}`,
         );
       }
       throw error;
     }
+  }
+
+  private async publishRecoveryClaim(): Promise<RecoveryClaim> {
+    const tempPath = `${this.recoveryPath}.${randomUUIDv7()}.tmp`;
+    let handle: FileHandle | null = null;
+    let identity: LockIdentity | null = null;
+    let published = false;
     try {
+      handle = await fsOpen(tempPath, 'wx');
       const info = await handle.stat({ bigint: true });
-      return { handle, identity: { dev: info.dev, ino: info.ino } };
+      identity = { dev: info.dev, ino: info.ino };
+      const metadata: RecoveryClaimMetadata = {
+        v: 1,
+        pid: process.pid,
+        processStartTimeMs: CURRENT_PROCESS_START_TIME_MS,
+        claimedAtMs: this.now(),
+      };
+      await this.writeRecoveryMetadata(handle, `${JSON.stringify(metadata)}\n`);
+      const tempInfo = await lstat(tempPath, { bigint: true });
+      if (tempInfo.dev !== identity.dev || tempInfo.ino !== identity.ino) {
+        throw new InstanceLockError(
+          `instance_lock_held: recovery claim staging changed for ${this.path}`,
+        );
+      }
+      // A hard-link publication has no empty/partial destination window: the
+      // recovery path either does not exist or names the fully synced inode.
+      await link(tempPath, this.recoveryPath);
+      published = true;
+      const claim: RecoveryClaim = { handle, identity };
+      await this.assertRecoveryClaimOwned(claim);
+      await this.removePathIfSame(tempPath, identity);
+      return claim;
     } catch (error) {
-      try {
-        await handle.close();
-      } catch {
-        /* ignore */
+      if (handle) await handle.close().catch(() => undefined);
+      if (identity) {
+        await this.cleanupCreatedPath(tempPath, identity);
+        if (published) await this.cleanupCreatedPath(this.recoveryPath, identity);
       }
       throw error;
     }
+  }
+
+  private async readRecoveryOwner(): Promise<{
+    metadata: RecoveryClaimMetadata | null;
+    identity: LockIdentity;
+    mtimeMs: number;
+  }> {
+    const handle = await fsOpen(this.recoveryPath, 'r');
+    try {
+      const info = await handle.stat({ bigint: true });
+      const raw = await handle.readFile({ encoding: 'utf8' });
+      return {
+        metadata: parseRecoveryClaim(raw),
+        identity: { dev: info.dev, ino: info.ino },
+        mtimeMs: Number(info.mtimeMs),
+      };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async acquireRecoveryClaim(): Promise<RecoveryClaim> {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      try {
+        return await this.publishRecoveryClaim();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+
+      let owner: Awaited<ReturnType<InstanceLock['readRecoveryOwner']>>;
+      try {
+        owner = await this.readRecoveryOwner();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw new InstanceLockError(
+          `instance_lock_held: cannot verify recovery owner for ${this.path}; refusing to steal it`,
+        );
+      }
+
+      const claimAgeMs = this.now() - (owner.metadata?.claimedAtMs ?? owner.mtimeMs);
+      const leaseExpired =
+        Number.isFinite(claimAgeMs) && claimAgeMs >= this.recoveryClaimLeaseMs;
+      if (owner.metadata) {
+        if (await this.isOwnerAlive(owner.metadata) && !leaseExpired) {
+          throw new InstanceLockError(
+            `instance_lock_held: stale recovery is already in progress for ${this.path}`,
+          );
+        }
+      } else {
+        if (!Number.isFinite(claimAgeMs) || claimAgeMs < this.recoveryClaimStaleMs) {
+          throw new InstanceLockError(
+            `instance_lock_held: recovery metadata is incomplete and may still be active for ${this.path}`,
+          );
+        }
+      }
+
+      if (!await this.removePathIfSame(this.recoveryPath, owner.identity)) {
+        continue;
+      }
+    }
+
+    throw new InstanceLockError(
+      `instance_lock_held: could not acquire recovery ownership for ${this.path}`,
+    );
   }
 
   private async releaseRecoveryClaim(claim: RecoveryClaim): Promise<void> {
@@ -188,13 +410,16 @@ export class InstanceLock {
     await this.cleanupCreatedPath(this.recoveryPath, claim.identity);
   }
 
-  private async readOwner(): Promise<{ pid: number | null; identity: LockIdentity }> {
+  private async readOwner(): Promise<{
+    metadata: LockOwnerMetadata | null;
+    identity: LockIdentity;
+  }> {
     const handle = await fsOpen(this.path, 'r');
     try {
       const info = await handle.stat({ bigint: true });
       const raw = await handle.readFile({ encoding: 'utf8' });
       return {
-        pid: parseLockPid(raw),
+        metadata: parseLockOwner(raw),
         identity: { dev: info.dev, ino: info.ino },
       };
     } finally {
@@ -202,97 +427,172 @@ export class InstanceLock {
     }
   }
 
+  private async installMainLock(
+    createdHandle: FileHandle,
+    recoveryClaim: RecoveryClaim | null,
+  ): Promise<void> {
+    let identity: LockIdentity | null = null;
+    try {
+      const createdInfo = await createdHandle.stat({ bigint: true });
+      identity = { dev: createdInfo.dev, ino: createdInfo.ino };
+      if (recoveryClaim) {
+        await this.assertRecoveryClaimOwned(recoveryClaim);
+      } else if (await this.recoveryClaimExists()) {
+        throw new InstanceLockError(
+          `instance_lock_held: stale recovery is in progress for ${this.path}`,
+        );
+      }
+      await this.writeMetadata(
+        createdHandle,
+        `${process.pid}\n${CURRENT_PROCESS_START_TIME_MS}\n`,
+      );
+      if (recoveryClaim) {
+        await this.assertRecoveryClaimOwned(recoveryClaim);
+      } else if (await this.recoveryClaimExists()) {
+        throw new InstanceLockError(
+          `instance_lock_held: stale recovery started while acquiring ${this.path}`,
+        );
+      }
+      this.handle = createdHandle;
+      this.ownedIdentity = identity;
+    } catch (error) {
+      await createdHandle.close().catch(() => undefined);
+      if (identity) await this.cleanupCreatedPath(this.path, identity);
+      throw error;
+    }
+  }
+
+  private async acquireMainUnderClaim(
+    claim: RecoveryClaim,
+    expectedOwner?: { metadata: LockOwnerMetadata; identity: LockIdentity },
+  ): Promise<void> {
+    await this.assertRecoveryClaimOwned(claim);
+    let owner: Awaited<ReturnType<InstanceLock['readOwner']>> | null = null;
+    try {
+      owner = await this.readOwner();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new InstanceLockError(
+          `instance_lock_held: cannot verify the owner of ${this.path}; refusing to steal it`,
+        );
+      }
+    }
+
+    if (owner) {
+      if (
+        expectedOwner &&
+        (owner.identity.dev !== expectedOwner.identity.dev ||
+          owner.identity.ino !== expectedOwner.identity.ino)
+      ) {
+        throw new InstanceLockError(
+          `instance_lock_held: owner changed during stale recovery for ${this.path}`,
+        );
+      }
+      if (!owner.metadata) {
+        throw new InstanceLockError(
+          `instance_lock_held: invalid owner metadata in ${this.path}; refusing to steal it`,
+        );
+      }
+      if (await this.isOwnerAlive(owner.metadata)) {
+        throw new InstanceLockError(
+          `instance_lock_held: another process (pid ${owner.metadata.pid}) holds ${this.path}. ` +
+            `Use a unique namespace per replica, or ensure the previous process shut down cleanly.`,
+        );
+      }
+      if (!expectedOwner) await this.afterStaleProbe?.();
+      await this.assertRecoveryClaimOwned(claim);
+      const removed = await this.removePathIfSame(this.path, owner.identity);
+      if (!removed) {
+        throw new InstanceLockError(
+          `instance_lock_held: owner changed during stale recovery for ${this.path}`,
+        );
+      }
+      await this.assertRecoveryClaimOwned(claim);
+      await this.afterStaleMainRemoved?.();
+      await this.assertRecoveryClaimOwned(claim);
+    }
+
+    await this.assertRecoveryClaimOwned(claim);
+    let createdHandle: FileHandle;
+    try {
+      createdHandle = await fsOpen(this.path, 'wx');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new InstanceLockError(
+          `instance_lock_held: owner changed during stale recovery for ${this.path}`,
+        );
+      }
+      throw error;
+    }
+    await this.installMainLock(createdHandle, claim);
+  }
+
   async acquire(): Promise<void> {
     if (this.handle) return;
 
     const createdDirectoryStart = await mkdir(dirname(this.path), { recursive: true });
     this.createdDirectoryStart ??= createdDirectoryStart;
-    let recoveryClaim: RecoveryClaim | null = null;
-
-    try {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        let createdHandle: FileHandle;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      if (await this.recoveryClaimExists()) {
+        const claim = await this.acquireRecoveryClaim();
         try {
-          createdHandle = await fsOpen(this.path, 'wx');
-        } catch (err) {
-          const code =
-            err && typeof err === 'object' && 'code' in err
-              ? (err as { code?: string }).code
-              : undefined;
-          if (code !== 'EEXIST') {
-            throw err instanceof Error
-              ? err
-              : new Error(`instance lock acquire failed: ${String(err)}`);
-          }
-          if (recoveryClaim) {
-            await Promise.resolve();
-            continue;
-          }
-
-          let owner: { pid: number | null; identity: LockIdentity };
-          try {
-            owner = await this.readOwner();
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
-            throw new InstanceLockError(
-              `instance_lock_held: cannot verify the owner of ${this.path}; refusing to steal it`,
-            );
-          }
-          if (owner.pid === null) {
-            throw new InstanceLockError(
-              `instance_lock_held: invalid owner metadata in ${this.path}; refusing to steal it`,
-            );
-          }
-          if (pidAlive(owner.pid, this.killProcess)) {
-            throw new InstanceLockError(
-              `instance_lock_held: another process (pid ${owner.pid}) holds ${this.path}. ` +
-                `Use a unique namespace per replica, or ensure the previous process shut down cleanly.`,
-            );
-          }
-
-          await this.afterStaleProbe?.();
-          recoveryClaim = await this.acquireRecoveryClaim();
-          const removed = await this.removePathIfSame(this.path, owner.identity);
-          if (!removed) {
-            throw new InstanceLockError(
-              `instance_lock_held: owner changed during stale recovery for ${this.path}`,
-            );
-          }
-          continue;
-        }
-
-        let identity: LockIdentity | null = null;
-        try {
-          const createdInfo = await createdHandle.stat({ bigint: true });
-          identity = { dev: createdInfo.dev, ino: createdInfo.ino };
-          if (!recoveryClaim && await this.recoveryClaimExists()) {
-            throw new InstanceLockError(
-              `instance_lock_held: stale recovery is in progress for ${this.path}`,
-            );
-          }
-          await this.writeMetadata(
-            createdHandle,
-            `${process.pid}\n${processStartTimeMs()}\n`,
-          );
-          this.handle = createdHandle;
-          this.ownedIdentity = identity;
+          await this.acquireMainUnderClaim(claim);
           return;
-        } catch (error) {
-          try {
-            await createdHandle.close();
-          } catch {
-            /* continue with ownership-checked cleanup */
-          }
-          if (identity) await this.cleanupCreatedPath(this.path, identity);
-          throw error;
+        } finally {
+          await this.releaseRecoveryClaim(claim);
         }
       }
-    } finally {
-      if (recoveryClaim) await this.releaseRecoveryClaim(recoveryClaim);
+
+      let createdHandle: FileHandle;
+      try {
+        createdHandle = await fsOpen(this.path, 'wx');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+          throw error instanceof Error
+            ? error
+            : new Error(`instance lock acquire failed: ${String(error)}`);
+        }
+
+        let owner: Awaited<ReturnType<InstanceLock['readOwner']>>;
+        try {
+          owner = await this.readOwner();
+        } catch (readError) {
+          if ((readError as NodeJS.ErrnoException).code === 'ENOENT') continue;
+          throw new InstanceLockError(
+            `instance_lock_held: cannot verify the owner of ${this.path}; refusing to steal it`,
+          );
+        }
+        if (!owner.metadata) {
+          throw new InstanceLockError(
+            `instance_lock_held: invalid owner metadata in ${this.path}; refusing to steal it`,
+          );
+        }
+        if (await this.isOwnerAlive(owner.metadata)) {
+          throw new InstanceLockError(
+            `instance_lock_held: another process (pid ${owner.metadata.pid}) holds ${this.path}. ` +
+              `Use a unique namespace per replica, or ensure the previous process shut down cleanly.`,
+          );
+        }
+
+        await this.afterStaleProbe?.();
+        const claim = await this.acquireRecoveryClaim();
+        try {
+          await this.acquireMainUnderClaim(claim, {
+            metadata: owner.metadata,
+            identity: owner.identity,
+          });
+          return;
+        } finally {
+          await this.releaseRecoveryClaim(claim);
+        }
+      }
+
+      await this.installMainLock(createdHandle, null);
+      return;
     }
 
     throw new InstanceLockError(
-      `instance_lock_held: could not acquire ${this.path} after retries`
+      `instance_lock_held: could not acquire ${this.path} after retries`,
     );
   }
 

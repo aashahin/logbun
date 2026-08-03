@@ -92,3 +92,14 @@ replace or remove it, including racing the final inode recheck and path-based
 unlink because portable runtimes expose no compare-and-unlink operation.
 Network filesystems may not provide the required exclusive-create or durability
 semantics.
+
+Stale-lock recovery claims are published only after complete PID/process-start
+metadata has been synced. A later process automatically replaces a claim whose
+owner is known dead or whose short recovery lease has expired; malformed claims
+left by older/crashed writers are eligible only after the same safety age.
+Permission or other unknown liveness-probe failures remain potentially live and
+fail closed during that lease, including Deno without an applicable process
+probe capability. Every claimant revalidates its claim inode around main-lock
+mutations, so an expired live claimant aborts rather than removing its
+replacement. Ordinary crash remnants do not require manual claim-file cleanup;
+do not manually remove a recent claim from a running namespace.

@@ -39,6 +39,12 @@ export interface FileReliabilityDlqOptions {
   maxEntries?: number;
 }
 
+/** @internal Constructor seams kept out of the supported adapter options. */
+interface FileReliabilityAdapterInternals {
+  walDirectorySync?: WALStorageOptions['directorySync'];
+  dlqDirectorySync?: DLQStorageOptions['directorySync'];
+}
+
 export interface FileReliabilityAdapterOptions {
   /** Isolates data under dataDir/namespace. */
   namespace: string;
@@ -80,13 +86,17 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
   private readonly encryptionKeyMaterial?: string | Uint8Array;
   private readonly walOpts: FileReliabilityWalOptions;
   private readonly dlqOpts: FileReliabilityDlqOptions;
+  private readonly internals: FileReliabilityAdapterInternals;
 
   private wal: WALStorage | null = null;
   private dlq: DLQStorage | null = null;
   private lock: InstanceLock | null = null;
   private ready = false;
 
-  constructor(options: FileReliabilityAdapterOptions) {
+  constructor(
+    options: FileReliabilityAdapterOptions,
+    internals: FileReliabilityAdapterInternals = {},
+  ) {
     if (!options?.namespace) {
       throw new Error('FileReliabilityAdapter requires namespace');
     }
@@ -97,6 +107,7 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
     this.encryptionKeyMaterial = options.encryptionKey;
     this.walOpts = options.wal ?? {};
     this.dlqOpts = options.dlq ?? {};
+    this.internals = internals;
   }
 
   /** Underlying WAL (tests / advanced). */
@@ -146,6 +157,7 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
       segmentBytes: this.walOpts.segmentBytes ?? WAL_SEGMENT_BYTES_DEFAULT,
       encryptionKey: encryptionKeyBytes,
       createdHierarchyStart: this.lock?.createdHierarchyStart,
+      directorySync: this.internals.walDirectorySync,
     };
     this.wal = new WALStorage(this.namespace, this.dataDir, walOptions);
     await this.wal.init();
@@ -154,6 +166,9 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
       fsync: this.dlqOpts.fsync ?? true,
       maxFiles: this.dlqOpts.maxEntries ?? 10_000,
       encryptionKey: encryptionKeyBytes,
+      directorySync: this.internals.dlqDirectorySync,
+      createdHierarchyStart:
+        this.lock?.createdHierarchyStart ?? this.wal.createdHierarchyStart,
     };
     this.dlq = new DLQStorage(this.namespace, this.dataDir, dlqOptions);
     await this.dlq.init();
@@ -266,9 +281,8 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
 
   async readDlq(id: string): Promise<ClaimedDlqBatch | null> {
     const { dlq } = this.ensure();
-    const resolved = await dlq.resolvePath(id);
-    if (!resolved) return null;
-    const batch = await dlq.readBatchFile(resolved.path);
+    const batch = await dlq.readById(id);
+    if (!batch) return null;
     return {
       id,
       tenantId: batch.tenantId,

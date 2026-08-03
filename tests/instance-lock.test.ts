@@ -1,6 +1,15 @@
 import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
-import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  unlink,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,6 +19,10 @@ import { AuditLogger } from '../src/logger';
 import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
 
 const cleanupPaths: string[] = [];
+
+function recoveryMetadata(pid = 2147483646, processStartTimeMs = 0): string {
+  return `${JSON.stringify({ v: 1, pid, processStartTimeMs })}\n`;
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -176,6 +189,269 @@ test('InstanceLock recovers a stale lock only when the owner probe returns ESRCH
   await lock.acquire();
   expect(await readFile(lockPath, 'utf8')).toStartWith(`${process.pid}\n`);
   await lock.release();
+});
+
+test.each([
+  { name: 'empty claim and old stale main', claim: '', main: '2147483645\n0\n', ageClaim: true },
+  { name: 'partial claim and old stale main', claim: '{"v":1', main: '2147483645\n0\n', ageClaim: true },
+  { name: 'dead claim and old stale main', claim: recoveryMetadata(), main: '2147483645\n0\n', ageClaim: false },
+  { name: 'dead claim with main absent', claim: recoveryMetadata(), main: null, ageClaim: false },
+  { name: 'dead claim with a newer dead main', claim: recoveryMetadata(), main: '2147483644\n0\n', ageClaim: false },
+] as const)(
+  'InstanceLock recovers a crash remnant with $name',
+  async ({ claim, main, ageClaim }) => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-claim-remnant-'));
+    cleanupPaths.push(dataDir);
+    const namespaceDir = join(dataDir, 'claim-remnant');
+    const lockPath = join(namespaceDir, '.instance.lock');
+    const recoveryPath = join(namespaceDir, '.instance.lock.recovery');
+    await mkdir(namespaceDir);
+    if (main !== null) await writeFile(lockPath, main);
+    await writeFile(recoveryPath, claim);
+    if (ageClaim) {
+      const old = new Date(Date.now() - 120_000);
+      await utimes(recoveryPath, old, old);
+    }
+
+    const lock = new InstanceLock('claim-remnant', dataDir, {
+      recoveryClaimStaleMs: 1_000,
+      killProcess: () => {
+        const error = new Error('process does not exist') as NodeJS.ErrnoException;
+        error.code = 'ESRCH';
+        throw error;
+      },
+    });
+    await expect(lock.acquire()).resolves.toBeUndefined();
+    expect(await readFile(lockPath, 'utf8')).toStartWith(`${process.pid}\n`);
+    expect(await readdir(namespaceDir)).not.toContain('.instance.lock.recovery');
+    await lock.release();
+  },
+);
+
+test('a recent malformed recovery claim fails closed as potentially active', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-recent-claim-'));
+  cleanupPaths.push(dataDir);
+  const namespaceDir = join(dataDir, 'recent-claim');
+  const recoveryPath = join(namespaceDir, '.instance.lock.recovery');
+  await mkdir(namespaceDir);
+  await writeFile(recoveryPath, '');
+  let probes = 0;
+  const lock = new InstanceLock('recent-claim', dataDir, {
+    recoveryClaimStaleMs: 60_000,
+    killProcess: () => {
+      probes++;
+      throw new Error('malformed claims have no safe PID to probe');
+    },
+  });
+
+  await expect(lock.acquire()).rejects.toBeInstanceOf(InstanceLockError);
+  expect(probes).toBe(0);
+  expect(await readFile(recoveryPath, 'utf8')).toBe('');
+});
+
+test('Deno liveness denial fails closed for a potentially live recovery claimant', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-claim-deno-'));
+  cleanupPaths.push(dataDir);
+  const namespaceDir = join(dataDir, 'claim-deno');
+  const recoveryPath = join(namespaceDir, '.instance.lock.recovery');
+  await mkdir(namespaceDir);
+  await writeFile(recoveryPath, recoveryMetadata());
+  const lock = new InstanceLock('claim-deno', dataDir, {
+    killProcess: () => {
+      const error = new Error('Deno --allow-run not granted') as NodeJS.ErrnoException;
+      error.code = 'ERR_DENO_NOT_CAPABLE';
+      error.name = 'NotCapable';
+      throw error;
+    },
+  });
+
+  await expect(lock.acquire()).rejects.toBeInstanceOf(InstanceLockError);
+  expect(await readFile(recoveryPath, 'utf8')).toBe(recoveryMetadata());
+});
+
+test('a live reused PID does not keep a dead recovery claim stranded', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-claim-pid-reuse-'));
+  cleanupPaths.push(dataDir);
+  const namespaceDir = join(dataDir, 'claim-pid-reuse');
+  const lockPath = join(namespaceDir, '.instance.lock');
+  const recoveryPath = join(namespaceDir, '.instance.lock.recovery');
+  await mkdir(namespaceDir);
+  await writeFile(recoveryPath, recoveryMetadata(4242, 1_000));
+  const lock = new InstanceLock('claim-pid-reuse', dataDir, {
+    killProcess: () => undefined,
+    readProcessStartTimeMs: () => 20_000,
+  });
+
+  await expect(lock.acquire()).resolves.toBeUndefined();
+  expect(await readFile(lockPath, 'utf8')).toStartWith(`${process.pid}\n`);
+  expect(await readdir(namespaceDir)).not.toContain('.instance.lock.recovery');
+  await lock.release();
+});
+
+test('two contenders recovering one dead claim install exactly one owner', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-claim-race-'));
+  cleanupPaths.push(dataDir);
+  const namespaceDir = join(dataDir, 'claim-race');
+  const lockPath = join(namespaceDir, '.instance.lock');
+  const recoveryPath = join(namespaceDir, '.instance.lock.recovery');
+  await mkdir(namespaceDir);
+  await writeFile(recoveryPath, recoveryMetadata());
+  const staleProbe = () => {
+    const error = new Error('process does not exist') as NodeJS.ErrnoException;
+    error.code = 'ESRCH';
+    throw error;
+  };
+  const first = new InstanceLock('claim-race', dataDir, { killProcess: staleProbe });
+  const second = new InstanceLock('claim-race', dataDir, { killProcess: staleProbe });
+
+  const results = await Promise.allSettled([first.acquire(), second.acquire()]);
+  expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+  expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+  expect(await readFile(lockPath, 'utf8')).toStartWith(`${process.pid}\n`);
+  expect(await readdir(namespaceDir)).not.toContain('.instance.lock.recovery');
+
+  const winner = results[0]!.status === 'fulfilled' ? first : second;
+  const loser = winner === first ? second : first;
+  await loser.release();
+  const third = new InstanceLock('claim-race', dataDir);
+  await expect(third.acquire()).rejects.toBeInstanceOf(InstanceLockError);
+  expect(await readFile(lockPath, 'utf8')).toStartWith(`${process.pid}\n`);
+  await winner.release();
+  await third.acquire();
+  await third.release();
+});
+
+test('recovery claim metadata failure closes and ownership-cleans its staged inode', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-claim-write-failure-'));
+  cleanupPaths.push(dataDir);
+  const namespaceDir = join(dataDir, 'claim-write-failure');
+  const lockPath = join(namespaceDir, '.instance.lock');
+  await mkdir(namespaceDir);
+  await writeFile(lockPath, '2147483646\n0\n');
+  let claimHandle: FileHandle | undefined;
+  const staleProbe = () => {
+    const error = new Error('process does not exist') as NodeJS.ErrnoException;
+    error.code = 'ESRCH';
+    throw error;
+  };
+  const failed = new InstanceLock('claim-write-failure', dataDir, {
+    killProcess: staleProbe,
+    writeRecoveryMetadata: async (handle) => {
+      claimHandle = handle;
+      await handle.writeFile('{"v":1', 'utf8');
+      const error = new Error('simulated recovery claim sync failure') as NodeJS.ErrnoException;
+      error.code = 'EIO';
+      throw error;
+    },
+  });
+
+  await expect(failed.acquire()).rejects.toThrow(/recovery claim sync failure/);
+  await expect(claimHandle!.stat()).rejects.toThrow();
+  expect(await readdir(namespaceDir)).toEqual(['.instance.lock']);
+  expect(await readFile(lockPath, 'utf8')).toBe('2147483646\n0\n');
+
+  const retry = new InstanceLock('claim-write-failure', dataDir, {
+    killProcess: staleProbe,
+  });
+  await expect(retry.acquire()).resolves.toBeUndefined();
+  await retry.release();
+});
+
+test('a claimant replaced before the main mutation aborts without unlinking the winner', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-claim-replaced-before-'));
+  cleanupPaths.push(dataDir);
+  const namespaceDir = join(dataDir, 'claim-replaced-before');
+  const lockPath = join(namespaceDir, '.instance.lock');
+  await mkdir(namespaceDir);
+  await writeFile(lockPath, '2147483646\n0\n');
+  let now = 1_000;
+  let signalBeforeMutation!: () => void;
+  const beforeMutation = new Promise<void>((resolve) => {
+    signalBeforeMutation = resolve;
+  });
+  let resumeFirst!: () => void;
+  const firstMayResume = new Promise<void>((resolve) => {
+    resumeFirst = resolve;
+  });
+  const staleProbe = () => {
+    const error = new Error('process does not exist') as NodeJS.ErrnoException;
+    error.code = 'ESRCH';
+    throw error;
+  };
+  const first = new InstanceLock('claim-replaced-before', dataDir, {
+    killProcess: staleProbe,
+    now: () => now,
+    recoveryClaimLeaseMs: 100,
+    beforeOwnedUnlink: async () => {
+      signalBeforeMutation();
+      await firstMayResume;
+    },
+  });
+  const firstAcquire = first.acquire();
+  await beforeMutation;
+  now = 1_101;
+
+  const winner = new InstanceLock('claim-replaced-before', dataDir, {
+    killProcess: staleProbe,
+    now: () => now,
+    recoveryClaimLeaseMs: 100,
+  });
+  await winner.acquire();
+  resumeFirst();
+  await expect(firstAcquire).rejects.toThrow(/owner changed during stale recovery/);
+  await first.release();
+  expect(await readFile(lockPath, 'utf8')).toStartWith(`${process.pid}\n`);
+  const loser = new InstanceLock('claim-replaced-before', dataDir);
+  await expect(loser.acquire()).rejects.toBeInstanceOf(InstanceLockError);
+  await winner.release();
+});
+
+test('a claimant replaced after removing stale main aborts before touching the winner', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-claim-replaced-after-'));
+  cleanupPaths.push(dataDir);
+  const namespaceDir = join(dataDir, 'claim-replaced-after');
+  const lockPath = join(namespaceDir, '.instance.lock');
+  await mkdir(namespaceDir);
+  await writeFile(lockPath, '2147483646\n0\n');
+  let now = 1_000;
+  let signalMainRemoved!: () => void;
+  const mainRemoved = new Promise<void>((resolve) => {
+    signalMainRemoved = resolve;
+  });
+  let resumeFirst!: () => void;
+  const firstMayResume = new Promise<void>((resolve) => {
+    resumeFirst = resolve;
+  });
+  const staleProbe = () => {
+    const error = new Error('process does not exist') as NodeJS.ErrnoException;
+    error.code = 'ESRCH';
+    throw error;
+  };
+  const first = new InstanceLock('claim-replaced-after', dataDir, {
+    killProcess: staleProbe,
+    now: () => now,
+    recoveryClaimLeaseMs: 100,
+    afterStaleMainRemoved: async () => {
+      signalMainRemoved();
+      await firstMayResume;
+    },
+  });
+  const firstAcquire = first.acquire();
+  await mainRemoved;
+  now = 1_101;
+
+  const winner = new InstanceLock('claim-replaced-after', dataDir, {
+    now: () => now,
+    recoveryClaimLeaseMs: 100,
+  });
+  await winner.acquire();
+  resumeFirst();
+  await expect(firstAcquire).rejects.toThrow(/recovery ownership/);
+  await first.release();
+  expect(await readFile(lockPath, 'utf8')).toStartWith(`${process.pid}\n`);
+  const loser = new InstanceLock('claim-replaced-after', dataDir);
+  await expect(loser.acquire()).rejects.toBeInstanceOf(InstanceLockError);
+  await winner.release();
 });
 
 test('concurrent stale recovery never unlinks the owner installed after a shared probe', async () => {

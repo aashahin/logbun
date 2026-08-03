@@ -67,7 +67,22 @@ export interface DLQStorageOptions {
   /** @internal Deterministic hard-link seam for unsupported-platform tests. */
   requeueLink?: (deadPath: string, pendingPath: string) => Promise<void>;
   /** @internal Deterministic directory-fsync seam for fault/order tests. */
-  directorySync?: (directory: string) => void | Promise<void>;
+  directorySync?: (
+    directory: string,
+    reason: DLQDirectorySyncReason,
+  ) => void | Promise<void>;
+  /** @internal Observes whether an operation was queued behind prior work. */
+  operationQueued?: (queuedBehindPriorOperation: boolean) => void;
+  /** @internal Earliest directory created by adapter setup before DLQ init. */
+  createdHierarchyStart?: string;
+}
+
+export type DLQDirectorySyncReason = 'initialize-hierarchy' | 'mutation';
+
+interface PendingDirectorySync {
+  directory: string;
+  reason: DLQDirectorySyncReason;
+  allowPermissionBoundary: boolean;
 }
 
 export const DLQ_MAX_FILES_DEFAULT = 10_000;
@@ -186,9 +201,16 @@ export class DLQStorage {
   private readonly afterRequeueLink?: DLQStorageOptions['afterRequeueLink'];
   private readonly requeueLink: NonNullable<DLQStorageOptions['requeueLink']>;
   private readonly directorySync?: DLQStorageOptions['directorySync'];
+  private readonly operationQueued?: DLQStorageOptions['operationQueued'];
+  private readonly createdHierarchyStart?: string;
+  private hierarchyStartPending?: string;
+  private readonly settledHierarchySyncs = new Set<string>();
+  private pendingDirectorySyncs: PendingDirectorySync[] = [];
+  private ready = false;
   private requeueRepairPending = false;
   private requeueTransitionInFlight = false;
-  private writeChain: Promise<void> = Promise.resolve();
+  private pendingOperations = 0;
+  private operationChain: Promise<void> = Promise.resolve();
 
   constructor(
     namespace: string,
@@ -208,15 +230,44 @@ export class DLQStorage {
     this.afterRequeueLink = options?.afterRequeueLink;
     this.requeueLink = options?.requeueLink ?? ((deadPath, pendingPath) => link(deadPath, pendingPath));
     this.directorySync = options?.directorySync;
+    this.operationQueued = options?.operationQueued;
+    this.createdHierarchyStart = options?.createdHierarchyStart
+      ? resolve(options.createdHierarchyStart)
+      : undefined;
   }
 
-  private runWriteExclusive<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.writeChain.then(fn, fn);
-    this.writeChain = run.then(
+  private runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const queuedBehindPriorOperation = this.pendingOperations > 0;
+    this.pendingOperations++;
+    try {
+      this.operationQueued?.(queuedBehindPriorOperation);
+    } catch (error) {
+      this.pendingOperations--;
+      return Promise.reject(error);
+    }
+    const execute = async (): Promise<T> => {
+      try {
+        return await fn();
+      } finally {
+        this.pendingOperations--;
+      }
+    };
+    const run = this.operationChain.then(execute, execute);
+    this.operationChain = run.then(
       () => undefined,
       () => undefined
     );
     return run;
+  }
+
+  private runReadyExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    return this.runExclusive(async () => {
+      if (!this.ready) {
+        throw new Error('DLQ not initialized — call init() first');
+      }
+      await this.retryPendingDirectorySync();
+      return fn();
+    });
   }
 
   get directory(): string {
@@ -228,14 +279,33 @@ export class DLQStorage {
   }
 
   async init(): Promise<void> {
-    await this.assertExistingDataDirAncestor();
-    await this.assertStorageSegments(true);
-    await mkdir(this.dir, { recursive: true });
-    await this.assertSecureDirectory();
-    await this.settleRequeueState(true);
+    return this.runExclusive(async () => {
+      if (this.ready) return;
+      await this.assertExistingDataDirAncestor();
+      await this.assertStorageSegments(true);
+      const createdHierarchyStart = await mkdir(this.dir, { recursive: true });
+      if (createdHierarchyStart && !this.hierarchyStartPending) {
+        this.hierarchyStartPending = resolve(createdHierarchyStart);
+      }
+      await this.assertSecureDirectory();
+      const retried = await this.retryPendingDirectorySync();
+      await this.publishCreatedHierarchy(retried);
+      await this.settleRequeueState(true);
+      this.hierarchyStartPending = undefined;
+      this.ready = true;
+    });
   }
 
   async countByKind(): Promise<{
+    pending: number;
+    processing: number;
+    dead: number;
+    total: number;
+  }> {
+    return this.runReadyExclusive(() => this.countByKindUnlocked());
+  }
+
+  private async countByKindUnlocked(): Promise<{
     pending: number;
     processing: number;
     dead: number;
@@ -427,12 +497,44 @@ export class DLQStorage {
     }
   }
 
-  private async fsyncDirectory(): Promise<void> {
+  private clearDirectorySyncDebt(
+    directory: string,
+    reason: DLQDirectorySyncReason,
+  ): void {
+    const index = this.pendingDirectorySyncs.findIndex(
+      (pending) => pending.directory === directory && pending.reason === reason,
+    );
+    if (index >= 0) this.pendingDirectorySyncs.splice(index, 1);
+  }
+
+  private markDirectoryMutation(
+    directory: string,
+    reason: DLQDirectorySyncReason,
+    allowPermissionBoundary = false,
+  ): void {
+    if (!this.fsync) return;
+    if (
+      this.pendingDirectorySyncs.some(
+        (pending) => pending.directory === directory && pending.reason === reason,
+      )
+    ) {
+      return;
+    }
+    this.pendingDirectorySyncs.push({ directory, reason, allowPermissionBoundary });
+  }
+
+  private async fsyncDirectory(
+    directory = this.dir,
+    reason: DLQDirectorySyncReason = 'mutation',
+    allowPermissionBoundary = false,
+  ): Promise<void> {
+    if (!this.fsync) return;
+    this.markDirectoryMutation(directory, reason, allowPermissionBoundary);
     try {
       if (this.directorySync) {
-        await this.directorySync(this.dir);
+        await this.directorySync(directory, reason);
       } else {
-        const fh = await open(this.dir, 'r');
+        const fh = await open(directory, 'r');
         try {
           await fh.sync();
         } finally {
@@ -443,9 +545,67 @@ export class DLQStorage {
       // Directory fsync is unavailable on a few supported filesystem/runtime
       // combinations. Other errors mean the requested durability was not met.
       const code = (error as NodeJS.ErrnoException).code;
-      if (!['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'EPERM'].includes(code ?? '')) {
+      const permissionBoundary =
+        allowPermissionBoundary &&
+        (code === 'EACCES' ||
+          code === 'ERR_DENO_NOT_CAPABLE' ||
+          (error as Error).name === 'NotCapable');
+      if (
+        !['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'EPERM'].includes(code ?? '') &&
+        !permissionBoundary
+      ) {
         throw error;
       }
+    }
+    this.clearDirectorySyncDebt(directory, reason);
+    if (reason === 'initialize-hierarchy') {
+      this.settledHierarchySyncs.add(directory);
+    }
+  }
+
+  private async retryPendingDirectorySync(): Promise<PendingDirectorySync[]> {
+    const retried: PendingDirectorySync[] = [];
+    while (this.pendingDirectorySyncs.length > 0) {
+      const pending = this.pendingDirectorySyncs[0]!;
+      await this.fsyncDirectory(
+        pending.directory,
+        pending.reason,
+        pending.allowPermissionBoundary,
+      );
+      retried.push(pending);
+    }
+    return retried;
+  }
+
+  private async publishCreatedHierarchy(
+    retried: PendingDirectorySync[],
+  ): Promise<void> {
+    if (!this.fsync) return;
+    const createdStart = this.createdHierarchyStart ?? this.hierarchyStartPending;
+    if (!createdStart) return;
+    const outermostTarget = dirname(resolve(createdStart));
+    let directory = this.namespaceDir;
+    for (;;) {
+      const allowPermissionBoundary =
+        directory !== this.namespaceDir && directory !== this.dataDir;
+      const wasRetried = retried.some(
+        (pending) =>
+          pending.directory === directory &&
+          pending.reason === 'initialize-hierarchy',
+      );
+      if (!wasRetried && !this.settledHierarchySyncs.has(directory)) {
+        await this.fsyncDirectory(
+          directory,
+          'initialize-hierarchy',
+          allowPermissionBoundary,
+        );
+      }
+      if (directory === outermostTarget) return;
+      const parent = dirname(directory);
+      if (parent === directory) {
+        throw new Error('DLQ created hierarchy escaped its configured data directory');
+      }
+      directory = parent;
     }
   }
 
@@ -571,6 +731,13 @@ export class DLQStorage {
   }
 
   async readBatchFile(path: string): Promise<ParsedDLQBatch> {
+    return this.runReadyExclusive(async () => {
+      await this.settleRequeueState();
+      return this.readBatchFileUnlocked(path);
+    });
+  }
+
+  private async readBatchFileUnlocked(path: string): Promise<ParsedDLQBatch> {
     await this.assertSecureExistingFile(path);
     // O_NOFOLLOW closes the check-to-use window for an entry that is swapped
     // to a symlink after physical validation but before its body is read.
@@ -590,8 +757,23 @@ export class DLQStorage {
     }
   }
 
+  /** Atomically resolve and read an opaque id under the DLQ operation chain. */
+  async readById(id: string): Promise<ParsedDLQBatch | null> {
+    return this.runReadyExclusive(async () => {
+      const resolved = await this.resolvePathUnlocked(id);
+      if (!resolved) return null;
+      return this.readBatchFileUnlocked(resolved.path);
+    });
+  }
+
   /** Resolve opaque id → absolute path for any state, or null. */
   async resolvePath(id: string): Promise<{ path: string; state: DlqState } | null> {
+    return this.runReadyExclusive(() => this.resolvePathUnlocked(id));
+  }
+
+  private async resolvePathUnlocked(
+    id: string,
+  ): Promise<{ path: string; state: DlqState } | null> {
     await this.settleRequeueState();
     if (typeof id !== 'string' || !OPAQUE_ID_RE.test(id)) {
       return null;
@@ -628,7 +810,7 @@ export class DLQStorage {
    * Capacity check + create are serialized (TOCTOU-safe).
    */
   async write(tenantId: string | null, logs: LogbunLog[]): Promise<string> {
-    return this.runWriteExclusive(async () => {
+    return this.runReadyExclusive(async () => {
       await this.assertCanWriteUnlocked();
       const id = randomUUIDv7();
       const path = this.pathFor(id, 'pending');
@@ -646,30 +828,30 @@ export class DLQStorage {
   }
 
   async listPending(): Promise<string[]> {
-    return this.listIdsByState('pending');
+    return this.runReadyExclusive(() => this.listIdsByStateUnlocked('pending'));
   }
 
   async listDead(): Promise<string[]> {
-    return this.listIdsByState('dead');
+    return this.runReadyExclusive(() => this.listIdsByStateUnlocked('dead'));
   }
 
   async listProcessing(): Promise<string[]> {
-    return this.listIdsByState('processing');
+    return this.runReadyExclusive(() => this.listIdsByStateUnlocked('processing'));
   }
 
   /** @deprecated Prefer list ids; returns absolute paths for internal tests. */
   async listPendingPaths(): Promise<string[]> {
-    return this.listPathsBySuffix('.batch');
+    return this.runReadyExclusive(() => this.listPathsBySuffixUnlocked('.batch'));
   }
 
-  private async listIdsByState(state: DlqState): Promise<string[]> {
+  private async listIdsByStateUnlocked(state: DlqState): Promise<string[]> {
     const suffix =
       state === 'pending'
         ? '.batch'
         : state === 'processing'
           ? '.batch.processing'
           : '.batch.dead';
-    const paths = await this.listPathsBySuffix(suffix);
+    const paths = await this.listPathsBySuffixUnlocked(suffix);
     return paths
       .map((p) => idFromFilename(p))
       .filter((id): id is string => !!id)
@@ -681,25 +863,33 @@ export class DLQStorage {
     includeProcessing?: boolean;
     includeDead?: boolean;
   }): Promise<DLQEntry[]> {
+    return this.runReadyExclusive(() => this.listAllUnlocked(opts));
+  }
+
+  private async listAllUnlocked(opts?: {
+    includePending?: boolean;
+    includeProcessing?: boolean;
+    includeDead?: boolean;
+  }): Promise<DLQEntry[]> {
     const includePending = opts?.includePending !== false;
     const includeProcessing = opts?.includeProcessing === true;
     const includeDead = opts?.includeDead === true;
 
     const items: { id: string; state: DlqState; path: string }[] = [];
     if (includePending) {
-      for (const p of await this.listPathsBySuffix('.batch')) {
+      for (const p of await this.listPathsBySuffixUnlocked('.batch')) {
         const id = idFromFilename(p);
         if (id) items.push({ id, state: 'pending', path: p });
       }
     }
     if (includeProcessing) {
-      for (const p of await this.listPathsBySuffix('.batch.processing')) {
+      for (const p of await this.listPathsBySuffixUnlocked('.batch.processing')) {
         const id = idFromFilename(p);
         if (id) items.push({ id, state: 'processing', path: p });
       }
     }
     if (includeDead) {
-      for (const p of await this.listPathsBySuffix('.batch.dead')) {
+      for (const p of await this.listPathsBySuffixUnlocked('.batch.dead')) {
         const id = idFromFilename(p);
         if (id) items.push({ id, state: 'dead', path: p });
       }
@@ -708,7 +898,7 @@ export class DLQStorage {
     const out: DLQEntry[] = [];
     for (const { id, state, path } of items) {
       try {
-        const batch = await this.readBatchFile(path);
+        const batch = await this.readBatchFileUnlocked(path);
         out.push({
           // The confined filename is authority; an envelope is data only.
           id,
@@ -739,7 +929,7 @@ export class DLQStorage {
    * Accepts an opaque stable id only; metadata paths are never authority.
    */
   async requeueDead(id: string): Promise<string> {
-    return this.runWriteExclusive(async () => {
+    return this.runReadyExclusive(async () => {
       await this.settleRequeueState();
       if (typeof id !== 'string' || !OPAQUE_ID_RE.test(id)) {
         throw new Error('requeueDead expects a dead DLQ entry id');
@@ -757,7 +947,7 @@ export class DLQStorage {
       await this.assertDestinationAbsent(newPath);
       await this.assertCanWriteUnlocked();
 
-      const batch = await this.readBatchFile(deadPath);
+      const batch = await this.readBatchFileUnlocked(deadPath);
       const stableId = idFromFilename(deadPath) || id;
       const envelope: DLQBatchEnvelope = {
         v: 2,
@@ -788,7 +978,7 @@ export class DLQStorage {
   }
 
   private async assertCanWriteUnlocked(): Promise<void> {
-    const counts = await this.countByKind();
+    const counts = await this.countByKindUnlocked();
     if (counts.pending + counts.processing >= this.maxFiles) {
       throw new Error(
         `dlq_full: pending+processing (${counts.pending + counts.processing}) >= maxFiles (${this.maxFiles})`
@@ -797,15 +987,17 @@ export class DLQStorage {
   }
 
   async deleteDead(id: string): Promise<void> {
-    const resolved = await this.resolvePath(id);
-    if (!resolved || resolved.state !== 'dead') {
-      throw new Error('deleteDead expects a dead DLQ entry id');
-    }
-    this.assertUnderDir(resolved.path);
-    await this.unlinkSecurely(resolved.path);
+    return this.runReadyExclusive(async () => {
+      const resolved = await this.resolvePathUnlocked(id);
+      if (!resolved || resolved.state !== 'dead') {
+        throw new Error('deleteDead expects a dead DLQ entry id');
+      }
+      this.assertUnderDir(resolved.path);
+      await this.unlinkSecurely(resolved.path);
+    });
   }
 
-  private async listPathsBySuffix(suffix: string): Promise<string[]> {
+  private async listPathsBySuffixUnlocked(suffix: string): Promise<string[]> {
     await this.settleRequeueState();
     await this.assertSecureDirectory();
     let entries: string[];
@@ -830,17 +1022,17 @@ export class DLQStorage {
   async claim(
     id?: string
   ): Promise<{ id: string; path: string; batch: ParsedDLQBatch } | null> {
-    return this.runWriteExclusive(async () => {
+    return this.runReadyExclusive(async () => {
       let pendingPath: string | null = null;
       let claimId: string | null = id ?? null;
 
       if (id) {
-        const resolved = await this.resolvePath(id);
+        const resolved = await this.resolvePathUnlocked(id);
         if (!resolved || resolved.state !== 'pending') return null;
         pendingPath = resolved.path;
         claimId = id;
       } else {
-        const paths = await this.listPathsBySuffix('.batch');
+        const paths = await this.listPathsBySuffixUnlocked('.batch');
         pendingPath = paths[0] ?? null;
         if (!pendingPath) return null;
         claimId = idFromFilename(pendingPath);
@@ -855,129 +1047,143 @@ export class DLQStorage {
       } catch {
         return null;
       }
-      const batch = await this.readBatchFile(processingPath);
+      const batch = await this.readBatchFileUnlocked(processingPath);
       return { id: claimId, path: processingPath, batch };
     });
   }
 
   /** @deprecated Prefer claim(id). Path-based mark for internal tests. */
   async markProcessing(filePath: string): Promise<string> {
-    await this.settleRequeueState();
-    this.assertUnderDir(filePath);
-    const id = idFromFilename(filePath);
-    if (!id) throw new Error('invalid DLQ path');
-    const processingPath = this.pathFor(id, 'processing');
-    this.assertUnderDir(processingPath);
-    await this.renameSecurely(filePath, processingPath);
-    return processingPath;
+    return this.runReadyExclusive(async () => {
+      await this.settleRequeueState();
+      this.assertUnderDir(filePath);
+      const id = idFromFilename(filePath);
+      if (!id) throw new Error('invalid DLQ path');
+      const processingPath = this.pathFor(id, 'processing');
+      this.assertUnderDir(processingPath);
+      await this.renameSecurely(filePath, processingPath);
+      return processingPath;
+    });
   }
 
   async markDone(idOrPath: string): Promise<void> {
-    const resolved = await this.resolvePath(idOrPath);
-    if (!resolved) {
-      // try as path
-      try {
-        this.assertUnderDir(idOrPath);
-        await this.unlinkSecurely(idOrPath);
-      } catch {
-        /* ignore */
+    return this.runReadyExclusive(async () => {
+      const resolved = await this.resolvePathUnlocked(idOrPath);
+      if (!resolved) {
+        // try as path
+        try {
+          this.assertUnderDir(idOrPath);
+          await this.unlinkSecurely(idOrPath);
+        } catch {
+          /* ignore */
+        }
+        return;
       }
-      return;
-    }
-    this.assertUnderDir(resolved.path);
-    await this.unlinkSecurely(resolved.path);
+      this.assertUnderDir(resolved.path);
+      await this.unlinkSecurely(resolved.path);
+    });
   }
 
   async markFailed(idOrPath: string): Promise<void> {
-    const resolved = await this.resolvePath(idOrPath);
-    if (!resolved || resolved.state !== 'processing') {
-      if (idOrPath.endsWith('.processing')) {
-        this.assertUnderDir(idOrPath);
-        const id = idFromFilename(idOrPath);
-        if (!id) throw new Error('invalid processing path');
-        const original = this.pathFor(id, 'pending');
-        await this.renameSecurely(idOrPath, original);
+    return this.runReadyExclusive(async () => {
+      const resolved = await this.resolvePathUnlocked(idOrPath);
+      if (!resolved || resolved.state !== 'processing') {
+        if (idOrPath.endsWith('.processing')) {
+          this.assertUnderDir(idOrPath);
+          const id = idFromFilename(idOrPath);
+          if (!id) throw new Error('invalid processing path');
+          const original = this.pathFor(id, 'pending');
+          await this.renameSecurely(idOrPath, original);
+        }
+        return;
       }
-      return;
-    }
-    const id = idFromFilename(resolved.path) || idOrPath;
-    const pending = this.pathFor(id, 'pending');
-    this.assertUnderDir(resolved.path);
-    this.assertUnderDir(pending);
-    await this.renameSecurely(resolved.path, pending);
+      const id = idFromFilename(resolved.path) || idOrPath;
+      const pending = this.pathFor(id, 'pending');
+      this.assertUnderDir(resolved.path);
+      this.assertUnderDir(pending);
+      await this.renameSecurely(resolved.path, pending);
+    });
   }
 
   async incrementAttempts(
     idOrPath: string,
     currentAttempts: number
   ): Promise<void> {
-    const resolved = await this.resolvePath(idOrPath);
-    const path = resolved?.path ?? idOrPath;
-    this.assertUnderDir(path);
-    const parsed = await this.readBatchFile(path);
-    const id = parsed.id || idFromFilename(path) || idOrPath;
-    const envelope: DLQBatchEnvelope = {
-      v: 2,
-      id,
-      tenantId: parsed.tenantId,
-      attempts: currentAttempts + 1,
-      logs: parsed.logs,
-    };
-    await this.writeFileBody(path, JSON.stringify(envelope));
+    return this.runReadyExclusive(async () => {
+      const resolved = await this.resolvePathUnlocked(idOrPath);
+      const path = resolved?.path ?? idOrPath;
+      this.assertUnderDir(path);
+      const parsed = await this.readBatchFileUnlocked(path);
+      const id = parsed.id || idFromFilename(path) || idOrPath;
+      const envelope: DLQBatchEnvelope = {
+        v: 2,
+        id,
+        tenantId: parsed.tenantId,
+        attempts: currentAttempts + 1,
+        logs: parsed.logs,
+      };
+      await this.writeFileBody(path, JSON.stringify(envelope));
+    });
   }
 
   async setAttempts(idOrPath: string, attempts: number): Promise<void> {
-    const resolved = await this.resolvePath(idOrPath);
-    if (!resolved) throw new Error('DLQ entry not found');
-    this.assertUnderDir(resolved.path);
-    const parsed = await this.readBatchFile(resolved.path);
-    const id = parsed.id || idFromFilename(resolved.path) || idOrPath;
-    const envelope: DLQBatchEnvelope = {
-      v: 2,
-      id,
-      tenantId: parsed.tenantId,
-      attempts,
-      logs: parsed.logs,
-    };
-    await this.writeFileBody(resolved.path, JSON.stringify(envelope));
+    return this.runReadyExclusive(async () => {
+      const resolved = await this.resolvePathUnlocked(idOrPath);
+      if (!resolved) throw new Error('DLQ entry not found');
+      this.assertUnderDir(resolved.path);
+      const parsed = await this.readBatchFileUnlocked(resolved.path);
+      const id = parsed.id || idFromFilename(resolved.path) || idOrPath;
+      const envelope: DLQBatchEnvelope = {
+        v: 2,
+        id,
+        tenantId: parsed.tenantId,
+        attempts,
+        logs: parsed.logs,
+      };
+      await this.writeFileBody(resolved.path, JSON.stringify(envelope));
+    });
   }
 
   async markPoisoned(idOrPath: string): Promise<void> {
-    const resolved = await this.resolvePath(idOrPath);
-    if (resolved && resolved.state === 'processing') {
-      const id = idFromFilename(resolved.path) || idOrPath;
-      const deadPath = this.pathFor(id, 'dead');
-      this.assertUnderDir(resolved.path);
-      this.assertUnderDir(deadPath);
-      await this.renameSecurely(resolved.path, deadPath);
-      return;
-    }
-    if (idOrPath.endsWith('.processing')) {
-      this.assertUnderDir(idOrPath);
-      const id = idFromFilename(idOrPath);
-      if (!id) throw new Error('invalid processing path');
-      const deadPath = this.pathFor(id, 'dead');
-      await this.renameSecurely(idOrPath, deadPath);
-    }
+    return this.runReadyExclusive(async () => {
+      const resolved = await this.resolvePathUnlocked(idOrPath);
+      if (resolved && resolved.state === 'processing') {
+        const id = idFromFilename(resolved.path) || idOrPath;
+        const deadPath = this.pathFor(id, 'dead');
+        this.assertUnderDir(resolved.path);
+        this.assertUnderDir(deadPath);
+        await this.renameSecurely(resolved.path, deadPath);
+        return;
+      }
+      if (idOrPath.endsWith('.processing')) {
+        this.assertUnderDir(idOrPath);
+        const id = idFromFilename(idOrPath);
+        if (!id) throw new Error('invalid processing path');
+        const deadPath = this.pathFor(id, 'dead');
+        await this.renameSecurely(idOrPath, deadPath);
+      }
+    });
   }
 
   async recoverOrphans(): Promise<void> {
-    await this.assertSecureDirectory();
-    await this.settleRequeueState(true);
-    let entries: string[];
-    try {
-      entries = await readdir(this.dir);
-    } catch {
-      return;
-    }
+    return this.runReadyExclusive(async () => {
+      await this.assertSecureDirectory();
+      await this.settleRequeueState(true);
+      let entries: string[];
+      try {
+        entries = await readdir(this.dir);
+      } catch {
+        return;
+      }
 
-    const orphans = entries.filter((f) => f.endsWith('.batch.processing'));
-    for (const orphan of orphans) {
-      const processingPath = join(this.dir, orphan);
-      const id = idFromFilename(processingPath);
-      if (!id) continue;
-      const batchPath = this.pathFor(id, 'pending');
-      await this.renameSecurely(processingPath, batchPath);
-    }
+      const orphans = entries.filter((f) => f.endsWith('.batch.processing'));
+      for (const orphan of orphans) {
+        const processingPath = join(this.dir, orphan);
+        const id = idFromFilename(processingPath);
+        if (!id) continue;
+        const batchPath = this.pathFor(id, 'pending');
+        await this.renameSecurely(processingPath, batchPath);
+      }
+    });
   }
 }
