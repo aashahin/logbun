@@ -4,35 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { FileReliabilityAdapter } from '../src/durability/filesystem';
+import { setFileReliabilityAdapterTestHooks } from '../src/durability/filesystem/adapter-test-hooks';
 
-interface AdapterTestHooks {
-  walDirectorySync?: (directory: string, reason: string) => void | Promise<void>;
-  dlqDirectorySync?: (directory: string, reason: string) => void | Promise<void>;
-  afterLockAcquire?: () => void | Promise<void>;
-}
-
-const hookSymbol = Symbol.for('logbun.FileReliabilityAdapter.testHooks');
 const cleanupPaths: string[] = [];
-const hookedNamespaces = new Set<string>();
-
-function hookRegistry(): Map<string, AdapterTestHooks> {
-  const globalRecord = globalThis as unknown as Record<PropertyKey, unknown>;
-  const current = globalRecord[hookSymbol];
-  if (current instanceof Map) return current as Map<string, AdapterTestHooks>;
-  const registry = new Map<string, AdapterTestHooks>();
-  globalRecord[hookSymbol] = registry;
-  return registry;
-}
-
-function setHooks(namespace: string, hooks: AdapterTestHooks): void {
-  hookedNamespaces.add(namespace);
-  hookRegistry().set(namespace, hooks);
-}
 
 afterEach(async () => {
-  const registry = hookRegistry();
-  for (const namespace of hookedNamespaces) registry.delete(namespace);
-  hookedNamespaces.clear();
   await Promise.all(
     cleanupPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -43,7 +19,8 @@ test('failed initialization releases local resources and the same adapter can re
   cleanupPaths.push(dataDir);
   const namespace = 'adapter-init-retry';
   let failOnce = true;
-  setHooks(namespace, {
+  const options = { namespace, dataDir };
+  setFileReliabilityAdapterTestHooks(options, {
     dlqDirectorySync: (_directory, reason) => {
       if (!failOnce || reason !== 'initialize-hierarchy') return;
       failOnce = false;
@@ -52,7 +29,7 @@ test('failed initialization releases local resources and the same adapter can re
       throw error;
     },
   });
-  const adapter = new FileReliabilityAdapter({ namespace, dataDir });
+  const adapter = new FileReliabilityAdapter(options);
 
   await expect(adapter.init()).rejects.toThrow(/DLQ initialization failure/);
   expect(adapter.walStorage).toBeNull();
@@ -70,14 +47,15 @@ test('concurrent init calls share one initialization flight and one instance loc
   let continueResolve!: () => void;
   const mayContinue = new Promise<void>((resolve) => { continueResolve = resolve; });
   let lockAcquires = 0;
-  setHooks(namespace, {
+  const options = { namespace, dataDir };
+  setFileReliabilityAdapterTestHooks(options, {
     afterLockAcquire: async () => {
       lockAcquires++;
       enteredResolve();
       await mayContinue;
     },
   });
-  const adapter = new FileReliabilityAdapter({ namespace, dataDir });
+  const adapter = new FileReliabilityAdapter(options);
 
   const first = adapter.init();
   await entered;
@@ -97,13 +75,14 @@ test('close waits for in-flight initialization, releases it, and permits a succe
   const entered = new Promise<void>((resolve) => { enteredResolve = resolve; });
   let continueResolve!: () => void;
   const mayContinue = new Promise<void>((resolve) => { continueResolve = resolve; });
-  setHooks(namespace, {
+  const options = { namespace, dataDir };
+  setFileReliabilityAdapterTestHooks(options, {
     afterLockAcquire: async () => {
       enteredResolve();
       await mayContinue;
     },
   });
-  const adapter = new FileReliabilityAdapter({ namespace, dataDir });
+  const adapter = new FileReliabilityAdapter(options);
 
   const initializing = adapter.init();
   await entered;
@@ -113,7 +92,6 @@ test('close waits for in-flight initialization, releases it, and permits a succe
   expect(adapter.walStorage).toBeNull();
   expect(adapter.dlqStorage).toBeNull();
 
-  hookRegistry().delete(namespace);
   const successor = new FileReliabilityAdapter({ namespace, dataDir });
   await expect(successor.init()).resolves.toBeUndefined();
   await successor.close();

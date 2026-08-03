@@ -19,7 +19,7 @@
  * probe the recorded process (currently `--allow-run`); unknown probes fail closed.
  */
 
-import { open as fsOpen, link, unlink, mkdir, lstat } from 'node:fs/promises';
+import { open as fsOpen, link, unlink, mkdir, lstat, readdir } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { resolveLogbunDir } from './path';
@@ -54,7 +54,7 @@ export interface InstanceLockOptions {
     stagedPath: string,
     canonicalPath: string,
   ) => void | Promise<void>;
-  /** Age after which malformed legacy recovery claims may be reclaimed. */
+  /** Safety age for malformed legacy claims and partial main staging remnants. */
   recoveryClaimStaleMs?: number;
   /** @internal Deterministic clock seam for legacy-claim aging tests. */
   now?: () => number;
@@ -92,6 +92,8 @@ interface RecoveryClaimMetadata {
   pid: number;
   processStartTimeMs: number;
 }
+
+const MAIN_STAGE_NAME_RE = /^\.instance\.lock\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/i;
 
 function probePidLiveness(
   pid: number,
@@ -256,6 +258,51 @@ export class InstanceLock {
       await this.removePathIfSame(path, identity);
     } catch {
       // Cleanup must never mask the original acquisition error.
+    }
+  }
+
+  /**
+   * Staging paths never confer namespace ownership. Retain recent/possibly-live
+   * writers, but ownership-clean complete dead stages and aged partial remnants.
+   */
+  private async cleanupAbandonedMainStages(): Promise<void> {
+    let names: string[];
+    try {
+      names = await readdir(dirname(this.path));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+
+    for (const name of names) {
+      if (!MAIN_STAGE_NAME_RE.test(name)) continue;
+      const stagedPath = join(dirname(this.path), name);
+      let handle: FileHandle | null = null;
+      let info: { dev: bigint; ino: bigint; mtimeMs: bigint };
+      let raw: string;
+      try {
+        handle = await fsOpen(stagedPath, 'r');
+        info = await handle.stat({ bigint: true });
+        raw = await handle.readFile({ encoding: 'utf8' });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        continue;
+      } finally {
+        await handle?.close().catch(() => undefined);
+      }
+      const parsed = parseLockOwner(raw);
+      // Main staging always writes both lines. A PID-only value can be a
+      // concurrently written prefix and is therefore an age-gated partial.
+      const complete = parsed?.processStartTimeMs != null ? parsed : null;
+      const mayRemove = complete
+        ? !await this.isOwnerAlive(complete)
+        : this.now() - Number(info.mtimeMs) >= this.recoveryClaimStaleMs;
+      if (mayRemove) {
+        await this.removePathIfSame(stagedPath, {
+          dev: info.dev,
+          ino: info.ino,
+        });
+      }
     }
   }
 
@@ -572,6 +619,7 @@ export class InstanceLock {
 
     const createdDirectoryStart = await mkdir(dirname(this.path), { recursive: true });
     this.createdDirectoryStart ??= createdDirectoryStart;
+    await this.cleanupAbandonedMainStages();
     for (let attempt = 0; attempt < 8; attempt++) {
       if (await this.recoveryClaimExists()) {
         const claim = await this.acquireRecoveryClaim();

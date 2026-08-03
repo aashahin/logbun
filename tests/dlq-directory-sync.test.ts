@@ -7,34 +7,12 @@ import {
   DLQStorage,
   FileReliabilityAdapter,
 } from '../src/durability/filesystem';
+import { setFileReliabilityAdapterTestHooks } from '../src/durability/filesystem/adapter-test-hooks';
 import type { LogbunLog } from '../src/types';
 
 const cleanupPaths: string[] = [];
-const adapterHookSymbol = Symbol.for('logbun.FileReliabilityAdapter.testHooks');
-const hookedNamespaces = new Set<string>();
-
-interface AdapterTestHooks {
-  walDirectorySync?: (directory: string, reason: string) => void | Promise<void>;
-  dlqDirectorySync?: (directory: string, reason: string) => void | Promise<void>;
-}
-
-function setAdapterHooks(namespace: string, hooks: AdapterTestHooks): void {
-  const globalRecord = globalThis as unknown as Record<PropertyKey, unknown>;
-  let registry = globalRecord[adapterHookSymbol];
-  if (!(registry instanceof Map)) {
-    registry = new Map<string, AdapterTestHooks>();
-    globalRecord[adapterHookSymbol] = registry;
-  }
-  (registry as Map<string, AdapterTestHooks>).set(namespace, hooks);
-  hookedNamespaces.add(namespace);
-}
 
 afterEach(async () => {
-  const registry = (globalThis as unknown as Record<PropertyKey, unknown>)[adapterHookSymbol];
-  if (registry instanceof Map) {
-    for (const namespace of hookedNamespaces) registry.delete(namespace);
-  }
-  hookedNamespaces.clear();
   await Promise.all(
     cleanupPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -197,15 +175,7 @@ test('adapter first-run sync order publishes WAL hierarchy before the later DLQ 
   const namespaceDir = join(dataDir, 'adapter-order');
   const walDir = join(namespaceDir, 'wal');
   const syncs: Array<{ owner: 'wal' | 'dlq'; directory: string; reason: string }> = [];
-  setAdapterHooks('adapter-order', {
-    walDirectorySync: (directory, reason) => {
-      syncs.push({ owner: 'wal', directory, reason });
-    },
-    dlqDirectorySync: (directory, reason) => {
-      syncs.push({ owner: 'dlq', directory, reason });
-    },
-  });
-  const adapter = new FileReliabilityAdapter({
+  const options = {
     namespace: 'adapter-order',
     dataDir,
     wal: {
@@ -214,7 +184,16 @@ test('adapter first-run sync order publishes WAL hierarchy before the later DLQ 
     dlq: {
       fsync: true,
     },
+  };
+  setFileReliabilityAdapterTestHooks(options, {
+    walDirectorySync: (directory, reason) => {
+      syncs.push({ owner: 'wal', directory, reason });
+    },
+    dlqDirectorySync: (directory, reason) => {
+      syncs.push({ owner: 'dlq', directory, reason });
+    },
   });
+  const adapter = new FileReliabilityAdapter(options);
 
   await adapter.init();
   expect(syncs).toEqual([
@@ -238,19 +217,20 @@ test('adapter DLQ publishes the full first-run hierarchy when WAL fsync is disab
   const dataDir = join(firstMissing, 'missing-b');
   const namespaceDir = join(dataDir, 'adapter-dlq-only');
   const syncs: Array<{ directory: string; reason: string }> = [];
-  setAdapterHooks('adapter-dlq-only', {
-    dlqDirectorySync: (directory, reason) => {
-      syncs.push({ directory, reason });
-    },
-  });
-  const adapter = new FileReliabilityAdapter({
+  const options = {
     namespace: 'adapter-dlq-only',
     dataDir,
     wal: { fsync: false },
     dlq: {
       fsync: true,
     },
+  };
+  setFileReliabilityAdapterTestHooks(options, {
+    dlqDirectorySync: (directory, reason) => {
+      syncs.push({ directory, reason });
+    },
   });
+  const adapter = new FileReliabilityAdapter(options);
 
   await adapter.init();
   expect(syncs).toEqual([

@@ -22,6 +22,10 @@ import {
 import { DLQStorage, type DLQStorageOptions } from './dlq';
 import { InstanceLock } from './instance-lock';
 import { assertNoSymlinkPath, resolveLogbunDir } from './path';
+import {
+  fileReliabilityAdapterTestHooksFor,
+  type FileReliabilityAdapterTestHooks,
+} from './adapter-test-hooks';
 import { join } from 'node:path';
 
 export interface FileReliabilityWalOptions {
@@ -37,22 +41,6 @@ export interface FileReliabilityDlqOptions {
   fsync?: boolean;
   /** Max pending+processing entries. @default 10_000 */
   maxEntries?: number;
-}
-
-/** Source-only test seams discovered through a process-local symbol registry. */
-interface FileReliabilityAdapterTestHooks {
-  walDirectorySync?: WALStorageOptions['directorySync'];
-  dlqDirectorySync?: DLQStorageOptions['directorySync'];
-  afterLockAcquire?: () => void | Promise<void>;
-}
-
-const TEST_HOOKS_SYMBOL = Symbol.for('logbun.FileReliabilityAdapter.testHooks');
-
-function testHooksFor(namespace: string): FileReliabilityAdapterTestHooks {
-  const globalRecord = globalThis as unknown as Record<PropertyKey, unknown>;
-  const registry = globalRecord[TEST_HOOKS_SYMBOL];
-  if (!(registry instanceof Map)) return {};
-  return (registry as Map<string, FileReliabilityAdapterTestHooks>).get(namespace) ?? {};
 }
 
 export interface FileReliabilityAdapterOptions {
@@ -96,6 +84,7 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
   private readonly encryptionKeyMaterial?: string | Uint8Array;
   private readonly walOpts: FileReliabilityWalOptions;
   private readonly dlqOpts: FileReliabilityDlqOptions;
+  private readonly testHooks?: FileReliabilityAdapterTestHooks;
 
   private wal: WALStorage | null = null;
   private dlq: DLQStorage | null = null;
@@ -116,6 +105,7 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
     this.encryptionKeyMaterial = options.encryptionKey;
     this.walOpts = options.wal ?? {};
     this.dlqOpts = options.dlq ?? {};
+    this.testHooks = fileReliabilityAdapterTestHooksFor(options);
   }
 
   /** Underlying WAL (tests / advanced). */
@@ -153,7 +143,6 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
     let localLock: InstanceLock | null = null;
     let localWal: WALStorage | null = null;
     let localDlq: DLQStorage | null = null;
-    const hooks = testHooksFor(this.namespace);
 
     try {
       // Validate before the instance lock or WAL can create anything through a
@@ -172,7 +161,7 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
       if (this.wantLock) {
         localLock = new InstanceLock(this.namespace, this.dataDir);
         await localLock.acquire();
-        await hooks.afterLockAcquire?.();
+        await this.testHooks?.afterLockAcquire?.();
       }
 
       let encryptionKeyBytes: Uint8Array | undefined;
@@ -191,7 +180,7 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
         segmentBytes: this.walOpts.segmentBytes ?? WAL_SEGMENT_BYTES_DEFAULT,
         encryptionKey: encryptionKeyBytes,
         createdHierarchyStart: localLock?.createdHierarchyStart,
-        directorySync: hooks.walDirectorySync,
+        directorySync: this.testHooks?.walDirectorySync,
       };
       localWal = new WALStorage(this.namespace, this.dataDir, walOptions);
       await localWal.init();
@@ -200,7 +189,7 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
         fsync: this.dlqOpts.fsync ?? true,
         maxFiles: this.dlqOpts.maxEntries ?? 10_000,
         encryptionKey: encryptionKeyBytes,
-        directorySync: hooks.dlqDirectorySync,
+        directorySync: this.testHooks?.dlqDirectorySync,
         createdHierarchyStart:
           localLock?.createdHierarchyStart ?? localWal.createdHierarchyStart,
       };

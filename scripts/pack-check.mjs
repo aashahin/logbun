@@ -41,14 +41,26 @@ try {
       join(consumer, 'node_modules', 'logbun', 'dist', 'durability', 'filesystem', declarationName),
       'utf8',
     );
-    if (declaration.includes('FileReliabilityAdapterInternals')) {
-      throw new Error(`${declarationName} leaked FileReliabilityAdapterInternals`);
+    if (
+      declaration.includes('FileReliabilityAdapterInternals') ||
+      declaration.includes('FileReliabilityAdapterTestHooks')
+    ) {
+      throw new Error(`${declarationName} leaked filesystem adapter test hooks`);
     }
     const classStart = declaration.indexOf('declare class FileReliabilityAdapter');
     const classEnd = declaration.indexOf('declare class InstanceLockError', classStart);
     const adapterDeclaration = declaration.slice(classStart, classEnd);
     if (!adapterDeclaration.includes('constructor(options: FileReliabilityAdapterOptions);')) {
       throw new Error(`${declarationName} does not expose the one-argument adapter constructor`);
+    }
+  }
+  for (const runtimeName of ['index.js', 'index.cjs']) {
+    const runtime = await readFile(
+      join(consumer, 'node_modules', 'logbun', 'dist', 'durability', 'filesystem', runtimeName),
+      'utf8',
+    );
+    if (runtime.includes('setFileReliabilityAdapterTestHooks')) {
+      throw new Error(`${runtimeName} retained the source-only adapter test setter`);
     }
   }
   await writeFile(

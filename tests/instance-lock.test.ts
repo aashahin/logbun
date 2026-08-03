@@ -1,5 +1,6 @@
 import { makeFileReliability } from './helpers';
 import { afterEach, expect, test } from 'bun:test';
+import { spawn } from 'node:child_process';
 import {
   mkdir,
   mkdtemp,
@@ -12,6 +13,7 @@ import {
 } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 
 import { InstanceLock, InstanceLockError } from '../src/durability/filesystem';
@@ -19,6 +21,36 @@ import { AuditLogger } from '../src/logger';
 import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
 
 const cleanupPaths: string[] = [];
+const crashFixture = fileURLToPath(
+  new URL('./fixtures/instance-lock-crash.ts', import.meta.url),
+);
+
+function crashDuringMainPublication(
+  phase: 'before' | 'after',
+  namespace: string,
+  dataDir: string,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [crashFixture, phase, namespace, dataDir], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      if (code === 0) {
+        reject(new Error(`crash fixture exited successfully:\n${stderr}`));
+        return;
+      }
+      if (signal !== 'SIGKILL' && code !== 137) {
+        reject(new Error(`crash fixture exited with ${code ?? signal}:\n${stderr}`));
+        return;
+      }
+      resolve();
+    });
+  });
+}
 
 function recoveryMetadata(pid = 2147483646, processStartTimeMs = 0): string {
   return `${JSON.stringify({ v: 1, pid, processStartTimeMs })}\n`;
@@ -88,6 +120,81 @@ test('main lock metadata is complete before canonical publication and exactly on
   await first.release();
   await second.release();
   expect(await readdir(namespaceDir)).toEqual([]);
+});
+
+test('a complete live staging inode is not ownership and is not removed from its publisher', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-live-stage-'));
+  cleanupPaths.push(dataDir);
+  const namespaceDir = join(dataDir, 'live-stage');
+  let signalStaged!: () => void;
+  const staged = new Promise<void>((resolve) => { signalStaged = resolve; });
+  let resumePublisher!: () => void;
+  const publisherMayResume = new Promise<void>((resolve) => { resumePublisher = resolve; });
+  const publisher = new InstanceLock('live-stage', dataDir, {
+    beforeMainPublish: async () => {
+      signalStaged();
+      await publisherMayResume;
+    },
+  });
+  const contender = new InstanceLock('live-stage', dataDir);
+
+  const publishing = publisher.acquire();
+  await staged;
+  expect((await readdir(namespaceDir)).filter((name) => name.endsWith('.tmp'))).toHaveLength(1);
+  await expect(contender.acquire()).resolves.toBeUndefined();
+  resumePublisher();
+  await expect(publishing).rejects.toBeInstanceOf(InstanceLockError);
+  expect((await readdir(namespaceDir)).filter((name) => name.endsWith('.tmp'))).toEqual([]);
+  await contender.release();
+});
+
+test.each(['before', 'after'] as const)(
+  'a SIGKILL %s canonical publication is recovered without accumulating staging files',
+  async (phase) => {
+    const dataDir = await mkdtemp(join(tmpdir(), `logbun-ilock-crash-${phase}-`));
+    cleanupPaths.push(dataDir);
+    const namespace = `crash-${phase}`;
+    const namespaceDir = join(dataDir, namespace);
+    const lockPath = join(namespaceDir, '.instance.lock');
+
+    await crashDuringMainPublication(phase, namespace, dataDir);
+    const crashedEntries = await readdir(namespaceDir);
+    expect(crashedEntries.filter((name) => name.endsWith('.tmp'))).toHaveLength(1);
+    if (phase === 'before') {
+      expect(crashedEntries).not.toContain('.instance.lock');
+    } else {
+      expect(await readFile(lockPath, 'utf8')).toMatch(/^\d+\n\d+\n$/);
+    }
+
+    const replacement = new InstanceLock(namespace, dataDir);
+    await expect(replacement.acquire()).resolves.toBeUndefined();
+    expect((await readdir(namespaceDir)).filter((name) => name.endsWith('.tmp'))).toEqual([]);
+    expect(await readFile(lockPath, 'utf8')).toStartWith(`${process.pid}\n`);
+    await replacement.release();
+  },
+);
+
+test('an aged partial main staging remnant is ownership-cleaned before acquisition', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-partial-stage-'));
+  cleanupPaths.push(dataDir);
+  const namespaceDir = join(dataDir, 'partial-stage');
+  const stagedPath = join(
+    namespaceDir,
+    '.instance.lock.018f0000-0000-7000-8000-000000000099.tmp',
+  );
+  await mkdir(namespaceDir);
+  await writeFile(stagedPath, `${process.pid}\n`);
+  const old = new Date(Date.now() - 120_000);
+  await utimes(stagedPath, old, old);
+
+  const lock = new InstanceLock('partial-stage', dataDir, {
+    recoveryClaimStaleMs: 1_000,
+  });
+  await expect(lock.acquire()).resolves.toBeUndefined();
+  expect(await readdir(namespaceDir)).not.toContain(
+    '.instance.lock.018f0000-0000-7000-8000-000000000099.tmp',
+  );
+  await lock.release();
 });
 
 test('metadata write failure closes and removes only the lock file it created', async () => {
