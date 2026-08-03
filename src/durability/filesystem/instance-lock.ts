@@ -292,11 +292,15 @@ export class InstanceLock {
       }
       const parsed = parseLockOwner(raw);
       // Main staging always writes both lines. A PID-only value can be a
-      // concurrently written prefix and is therefore an age-gated partial.
+      // concurrently written prefix: even after the safety age, retain it
+      // unless its parseable owner is also proven dead.
       const complete = parsed?.processStartTimeMs != null ? parsed : null;
+      const aged = this.now() - Number(info.mtimeMs) >= this.recoveryClaimStaleMs;
       const mayRemove = complete
         ? !await this.isOwnerAlive(complete)
-        : this.now() - Number(info.mtimeMs) >= this.recoveryClaimStaleMs;
+        : parsed
+          ? aged && !await this.isOwnerAlive(parsed)
+          : aged;
       if (mayRemove) {
         await this.removePathIfSame(stagedPath, {
           dev: info.dev,

@@ -183,18 +183,56 @@ test('an aged partial main staging remnant is ownership-cleaned before acquisiti
     '.instance.lock.018f0000-0000-7000-8000-000000000099.tmp',
   );
   await mkdir(namespaceDir);
-  await writeFile(stagedPath, `${process.pid}\n`);
+  await writeFile(stagedPath, '2147483646\n');
   const old = new Date(Date.now() - 120_000);
   await utimes(stagedPath, old, old);
 
   const lock = new InstanceLock('partial-stage', dataDir, {
     recoveryClaimStaleMs: 1_000,
+    killProcess: () => {
+      const error = new Error('staged process is dead') as NodeJS.ErrnoException;
+      error.code = 'ESRCH';
+      throw error;
+    },
   });
   await expect(lock.acquire()).resolves.toBeUndefined();
   expect(await readdir(namespaceDir)).not.toContain(
     '.instance.lock.018f0000-0000-7000-8000-000000000099.tmp',
   );
   await lock.release();
+});
+
+test('an aged PID-only stage from a live paused publisher is retained', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-live-partial-stage-'));
+  cleanupPaths.push(dataDir);
+  let signalPartial!: () => void;
+  const partial = new Promise<void>((resolve) => { signalPartial = resolve; });
+  let resumePublisher!: () => void;
+  const publisherMayResume = new Promise<void>((resolve) => { resumePublisher = resolve; });
+  const publisher = new InstanceLock('live-partial-stage', dataDir, {
+    recoveryClaimStaleMs: 1,
+    writeMetadata: async (handle, metadata) => {
+      await handle.writeFile(`${process.pid}\n`, 'utf8');
+      const old = new Date(Date.now() - 120_000);
+      await handle.utimes(old, old);
+      signalPartial();
+      await publisherMayResume;
+      await handle.truncate(0);
+      await handle.write(metadata, 0, 'utf8');
+      await handle.truncate(new TextEncoder().encode(metadata).byteLength);
+      await handle.sync();
+    },
+  });
+  const contender = new InstanceLock('live-partial-stage', dataDir, {
+    recoveryClaimStaleMs: 1,
+  });
+
+  const publishing = publisher.acquire();
+  await partial;
+  await expect(contender.acquire()).resolves.toBeUndefined();
+  resumePublisher();
+  await expect(publishing).rejects.toBeInstanceOf(InstanceLockError);
+  await contender.release();
 });
 
 test('metadata write failure closes and removes only the lock file it created', async () => {
