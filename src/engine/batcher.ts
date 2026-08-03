@@ -101,6 +101,8 @@ export class Batcher {
   private recoveryPumpQueued = false;
   /** A failed read is retried only when a host starts a later flush cycle. */
   private recoveryRetryDeferred = false;
+  /** Exact committed scheduling failure retained by a detached auto-flush. */
+  private pendingCommittedSchedulingError: unknown;
 
   private readonly config: BatchingConfig;
   private readonly mode: DurabilityMode;
@@ -179,6 +181,27 @@ export class Batcher {
       detail: this.isDlqFullError(err) ? 'dlq_full' : fallbackDetail,
       error: msg,
     });
+  }
+
+  /**
+   * A DLQ mutation can commit before its host wake-up fails. Treat that copy as
+   * durable, retire any WAL copy, and preserve the original tagged error.
+   */
+  private async propagateCommittedDlqSchedulingError(
+    error: unknown,
+    tenantId: string | null,
+    logs: LogbunLog[],
+    detail: string,
+    acknowledgeWal = true,
+  ): Promise<never> {
+    if (acknowledgeWal) await this.acknowledgeJournal(logs);
+    this.emit({
+      type: 'dlq',
+      tenantId,
+      count: logs.length,
+      detail,
+    });
+    throw error;
   }
 
   beginShutdown(): void {
@@ -328,6 +351,7 @@ export class Batcher {
             error: insertResult.error,
           });
         } catch (err) {
+          if (isDurableAdmissionSchedulingError(err)) throw err;
           await this.persistSnapshotToDlq(tenantId, snapshot, 'flush_error');
           this.emit({
             type: 'flush_fail',
@@ -395,6 +419,7 @@ export class Batcher {
    * in-flight safety — shutdown is best-effort after the deadline.
    */
   async flushAll(): Promise<void> {
+    this.throwPendingCommittedSchedulingError();
     this.recoveryRetryDeferred = false;
     this.drainRecoveryBacklog(true);
 
@@ -416,7 +441,17 @@ export class Batcher {
             (this.queues.get(a)?.length ?? 0)
         );
       if (keys.length > 0) {
-        await Promise.allSettled(keys.map((key) => this.flush(key)));
+        const results = await Promise.allSettled(
+          keys.map((key) => this.flush(key)),
+        );
+        const committedSchedulingFailure = results.find(
+          (result) =>
+            result.status === 'rejected' &&
+            isDurableAdmissionSchedulingError(result.reason),
+        );
+        if (committedSchedulingFailure?.status === 'rejected') {
+          throw committedSchedulingFailure.reason;
+        }
       }
 
       if (this.inflightFlushes === 0) {
@@ -455,6 +490,7 @@ export class Batcher {
         // Non-fatal; unacked entries remain for next boot
       }
     }
+    this.throwPendingCommittedSchedulingError();
   }
 
   /**
@@ -689,7 +725,8 @@ export class Batcher {
       if (this.reliability.persistent) {
         try {
           await this.reliability.appendJournal(log);
-        } catch {
+        } catch (error) {
+          if (isDurableAdmissionSchedulingError(error)) throw error;
           this.emit({ type: 'wal_fail', tenantId, detail: 'shutdown_enqueue' });
         }
       }
@@ -700,11 +737,20 @@ export class Batcher {
         this.emit({ type: 'dlq', tenantId, count: 1, detail: 'shutdown' });
         return true;
       } catch (err) {
+        if (isDurableAdmissionSchedulingError(err)) {
+          return this.propagateCommittedDlqSchedulingError(
+            err,
+            tenantId,
+            [log],
+            'shutdown',
+          );
+        }
         // WAL still holds the log if append succeeded
         this.emitDlqWriteFail(tenantId, 1, err, 'shutdown_dlq_fail');
         return false;
       }
-    } catch {
+    } catch (error) {
+      if (isDurableAdmissionSchedulingError(error)) throw error;
       // fire() never-throws contract
       return false;
     }
@@ -878,6 +924,14 @@ export class Batcher {
         });
         return true;
       } catch (err) {
+        if (isDurableAdmissionSchedulingError(err)) {
+          return this.propagateCommittedDlqSchedulingError(
+            err,
+            tenantId,
+            [log],
+            'queue_room_fail',
+          );
+        }
         // Unacked WAL still holds the log for crash recovery
         if (this.isDlqFullError(err)) {
           this.emitDlqWriteFail(tenantId, 1, err, 'queue_room_fail');
@@ -929,9 +983,24 @@ export class Batcher {
           detail: 'wal_fail',
         });
         return 'dlq';
-      } catch (err) {
+      } catch (dlqError) {
+        if (isDurableAdmissionSchedulingError(dlqError)) {
+          this.emit({
+            type: 'wal_fail',
+            tenantId,
+            detail: walFull ? 'wal_full' : 'append',
+            error: walMsg,
+          });
+          return this.propagateCommittedDlqSchedulingError(
+            dlqError,
+            tenantId,
+            [log],
+            'wal_fail',
+            false,
+          );
+        }
         this.emit({ type: 'wal_fail', tenantId, detail: 'append' });
-        this.emitDlqWriteFail(tenantId, 1, err, 'wal_and_dlq_fail');
+        this.emitDlqWriteFail(tenantId, 1, dlqError, 'wal_and_dlq_fail');
         return 'fail';
       }
     }
@@ -939,15 +1008,44 @@ export class Batcher {
 
   private armFlush(key: string, queue: LogbunLog[]): void {
     if (queue.length >= this.flushChunkSize()) {
-      void this.flush(key);
+      this.flushInBackground(key);
       return;
     }
     if (this.timers.has(key)) return;
     const timer = setTimeout(() => {
       this.timers.delete(key);
-      void this.flush(key);
+      this.flushInBackground(key);
     }, this.config.flushInterval);
     this.timers.set(key, timer);
+  }
+
+  /**
+   * Auto-flush has no direct caller. Retain committed scheduling failures so
+   * the next explicit flush/maintenance receives the exact tagged object, and
+   * emit immediately so fire-and-forget users still have observability.
+   */
+  private flushInBackground(key: string): void {
+    void this.flush(key).catch((error) => {
+      const committed = isDurableAdmissionSchedulingError(error);
+      if (committed && this.pendingCommittedSchedulingError === undefined) {
+        this.pendingCommittedSchedulingError = error;
+      }
+      this.emit({
+        type: 'flush_fail',
+        tenantId: key === '__global__' ? null : key,
+        detail: committed
+          ? 'background_committed_scheduling'
+          : 'background_flush',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
+
+  private throwPendingCommittedSchedulingError(): void {
+    const error = this.pendingCommittedSchedulingError;
+    if (error === undefined) return;
+    this.pendingCommittedSchedulingError = undefined;
+    throw error;
   }
 
   // ─── Flush helpers ──────────────────────────────────────────────────
@@ -980,6 +1078,14 @@ export class Batcher {
           detail: 'tenant_adapter',
         });
       } catch (dlqErr) {
+        if (isDurableAdmissionSchedulingError(dlqErr)) {
+          return this.propagateCommittedDlqSchedulingError(
+            dlqErr,
+            tenantId,
+            snapshot,
+            'tenant_adapter',
+          );
+        }
         // both failed — WAL still holds durable copy
         this.emitDlqWriteFail(
           tenantId,
@@ -1044,6 +1150,14 @@ export class Batcher {
         detail,
       });
     } catch (err) {
+      if (isDurableAdmissionSchedulingError(err)) {
+        return this.propagateCommittedDlqSchedulingError(
+          err,
+          tenantId,
+          snapshot,
+          detail,
+        );
+      }
       // Durable data may still be in WAL — do NOT ack
       this.emitDlqWriteFail(tenantId, snapshot.length, err, detail);
     }
@@ -1076,6 +1190,15 @@ export class Batcher {
     try {
       await this.reliability.writeDlq(tenantId, snapshot);
     } catch (err) {
+      if (isDurableAdmissionSchedulingError(err)) {
+        this.maybePruneQueue(key);
+        return this.propagateCommittedDlqSchedulingError(
+          err,
+          tenantId,
+          snapshot,
+          'backpressure',
+        );
+      }
       // Restore without acking journal — never leave the only copy only in-flight
       queue.unshift(...snapshot);
       // Always emit: dlq_full is the common ops signal; other write errors surface too

@@ -162,7 +162,11 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
       }
 
       if (this.wantLock) {
-        localLock = new InstanceLock(this.namespace, this.dataDir);
+        localLock = new InstanceLock(
+          this.namespace,
+          this.dataDir,
+          this.testHooks?.instanceLockOptions,
+        );
         await localLock.acquire();
         await this.testHooks?.afterLockAcquire?.();
       }
@@ -242,7 +246,6 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
       this.ready = false;
       this.wal = null;
       this.dlq = null;
-      this.lock = null;
 
       const closeErrors: unknown[] = [];
       try {
@@ -252,6 +255,7 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
       }
       try {
         await lock?.release();
+        if (this.lock === lock) this.lock = null;
       } catch (error) {
         closeErrors.push(error);
       }

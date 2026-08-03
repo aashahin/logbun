@@ -10,6 +10,7 @@ import type {
 } from './types';
 import { bootstrap, runRetentionPrune, type BootstrapResult } from './bootstrap';
 import { safeEmit } from './events';
+import { isDurableAdmissionSchedulingError } from './reliability/scheduling-error';
 import { capString } from './utils/json';
 import { isTenantIdPresent } from './utils/tenant';
 import {
@@ -561,20 +562,40 @@ export class AuditLogger<TActions extends string = string> {
     const requestMaintenance =
       this.engine.reliability.requestMaintenance ??
       this.engine.reliability.rearmMaintenance;
+    const committedSchedulingFailure = failures.find(
+      isDurableAdmissionSchedulingError,
+    );
     if (requestMaintenance) {
       try {
         await requestMaintenance.call(this.engine.reliability);
       } catch (rearmError) {
+        this.emit({
+          type: 'flush_fail',
+          error:
+            rearmError instanceof Error
+              ? rearmError.message
+              : String(rearmError),
+          detail: 'maintenance_rearm',
+        });
+        if (committedSchedulingFailure !== undefined) {
+          throw committedSchedulingFailure;
+        }
         if (failures.length === 0) throw rearmError;
         throw new AggregateError(
           [...failures, rearmError],
           'maintenance failed and its host wake-up could not be restored',
         );
       }
+      if (committedSchedulingFailure !== undefined) {
+        throw committedSchedulingFailure;
+      }
       if (failures.length === 1) throw failures[0];
       if (failures.length > 1) {
         throw new AggregateError(failures, 'multiple maintenance phases failed');
       }
+    }
+    if (committedSchedulingFailure !== undefined) {
+      throw committedSchedulingFailure;
     }
     // Retention failures historically propagated on adapters without a host
     // rearm seam; retain that contract. Flush/scan remain observable events.

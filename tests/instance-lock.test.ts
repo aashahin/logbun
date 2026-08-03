@@ -75,6 +75,45 @@ test('InstanceLock exclusive: second acquire fails while first holds', async () 
   await b.release();
 });
 
+test('release surfaces unlink failure, retains ownership, and succeeds on retry', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-release-retry-'));
+  cleanupPaths.push(dataDir);
+  let failUnlink = true;
+  const owner = new InstanceLock('release-retry', dataDir, {
+    afterOwnedUnlinkCheck: () => {
+      if (!failUnlink) return;
+      const error = new Error('simulated release unlink failure') as NodeJS.ErrnoException;
+      error.code = 'EIO';
+      throw error;
+    },
+  });
+  const contender = new InstanceLock('release-retry', dataDir);
+  await owner.acquire();
+
+  await expect(owner.release()).rejects.toThrow(/release unlink failure/);
+  await expect(contender.acquire()).rejects.toBeInstanceOf(InstanceLockError);
+
+  failUnlink = false;
+  await expect(owner.release()).resolves.toBeUndefined();
+  await expect(contender.acquire()).resolves.toBeUndefined();
+  await contender.release();
+});
+
+test('release never unlinks a replacement identity and safely forgets prior ownership', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-release-replacement-'));
+  cleanupPaths.push(dataDir);
+  const namespace = 'release-replacement';
+  const lockPath = join(dataDir, namespace, '.instance.lock');
+  const owner = new InstanceLock(namespace, dataDir);
+  await owner.acquire();
+  await unlink(lockPath);
+  await writeFile(lockPath, 'replacement-owner\n');
+
+  await expect(owner.release()).resolves.toBeUndefined();
+  await expect(owner.release()).resolves.toBeUndefined();
+  expect(await readFile(lockPath, 'utf8')).toBe('replacement-owner\n');
+});
+
 test('main lock metadata is complete before canonical publication and exactly one contender wins', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-main-publish-'));
   cleanupPaths.push(dataDir);

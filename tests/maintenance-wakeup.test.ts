@@ -154,3 +154,116 @@ test('maintenance rearms after settlement storage failure and the next pass deli
   expect(requests.calls()).toBe(2);
   await audit.shutdown();
 });
+
+test('maintenance preserves a committed scheduling error and later drains its single DLQ copy', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-maintenance-committed-schedule-'));
+  cleanupPaths.push(dataDir);
+  const reliability = new FileReliabilityAdapter({
+    namespace: 'maintenance-committed-schedule',
+    dataDir,
+    wal: { fsync: false },
+    dlq: { fsync: false },
+  });
+  const requests = observeMaintenanceRequests(reliability);
+  const writeDlq = reliability.writeDlq.bind(reliability);
+  const committedError = Object.assign(new Error('cross-bundle setAlarm EIO'), {
+    name: 'DurableAdmissionSchedulingError',
+    durableAdmissionCommitted: true as const,
+  });
+  let failScheduling = true;
+  reliability.writeDlq = async (tenantId, entries) => {
+    const id = await writeDlq(tenantId, entries);
+    if (failScheduling) {
+      failScheduling = false;
+      throw committedError;
+    }
+    return id;
+  };
+  let destinationDown = true;
+  const destination = memoryAdapter({ failInsert: () => destinationDown });
+  const audit = new AuditLogger({
+    namespace: 'maintenance-committed-schedule',
+    mode: 'durable',
+    reliability,
+    adapter: destination,
+    batching: { maxSize: 10, flushInterval: 60_000 },
+    retry: { insertMaxRetries: 1, insertBaseDelayMs: 0 },
+  });
+  await audit.ready;
+  await audit.fireAsync('maintenance.committed-schedule', { actorId: 'actor' });
+
+  const observed = await audit.runMaintenance().then(
+    () => null,
+    (error: unknown) => error,
+  );
+  expect(observed).toBe(committedError);
+  expect((await reliability.recoverJournal()).logs).toEqual([]);
+  expect(await reliability.listDlq()).toEqual([
+    expect.objectContaining({ state: 'pending', logCount: 1 }),
+  ]);
+  expect(requests.calls()).toBe(1);
+
+  destinationDown = false;
+  await audit.runMaintenance();
+  expect(destination.inserted).toHaveLength(1);
+  expect(await reliability.listDlq()).toEqual([]);
+  expect(requests.calls()).toBe(2);
+  await audit.shutdown();
+});
+
+test.each(['absent', 'failing'] as const)(
+  'maintenance preserves a committed scheduling error when its rearm hook is %s',
+  async (rearmMode) => {
+    const dataDir = await mkdtemp(join(tmpdir(), `logbun-maintenance-${rearmMode}-rearm-`));
+    cleanupPaths.push(dataDir);
+    const namespace = `maintenance-${rearmMode}-rearm`;
+    const reliability = new FileReliabilityAdapter({
+      namespace,
+      dataDir,
+      wal: { fsync: false },
+      dlq: { fsync: false },
+    });
+    if (rearmMode === 'failing') {
+      Object.assign(reliability, {
+        async requestMaintenance() {
+          throw new Error('simulated rearm failure');
+        },
+      });
+    }
+    const writeDlq = reliability.writeDlq.bind(reliability);
+    const committedError = Object.assign(
+      new Error(`cross-bundle ${rearmMode} rearm scheduling failure`),
+      {
+        name: 'DurableAdmissionSchedulingError',
+        durableAdmissionCommitted: true as const,
+      },
+    );
+    reliability.writeDlq = async (tenantId, entries) => {
+      const id = await writeDlq(tenantId, entries);
+      throw committedError;
+    };
+    const audit = new AuditLogger({
+      namespace,
+      mode: 'durable',
+      reliability,
+      adapter: memoryAdapter({ failInsert: true }),
+      batching: { maxSize: 10, flushInterval: 60_000 },
+      retry: { insertMaxRetries: 1, insertBaseDelayMs: 0 },
+    });
+    await audit.ready;
+    await audit.fireAsync('maintenance.committed-schedule', {
+      actorId: 'actor',
+    });
+
+    const observed = await audit.runMaintenance().then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(observed).toBe(committedError);
+    expect((await reliability.recoverJournal()).logs).toEqual([]);
+    expect(await reliability.listDlq()).toEqual([
+      expect.objectContaining({ state: 'pending', logCount: 1 }),
+    ]);
+    await audit.shutdown();
+  },
+);

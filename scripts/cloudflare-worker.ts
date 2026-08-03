@@ -71,6 +71,24 @@ export class AuditDO {
         headers: { 'content-type': 'application/json' },
       });
 
+    if (url.pathname === '/admit-unscheduled') {
+      const unscheduled = new CloudflareReliabilityAdapter({
+        state: this.state,
+        tablePrefix: 'audit_test',
+        scheduleAlarms: false,
+      });
+      await unscheduled.init();
+      const id = randomUUIDv7();
+      await unscheduled.appendJournal({
+        id,
+        actorId: 'worker-user',
+        action: url.searchParams.get('action') ?? 'audit.unscheduled',
+        tenantId: 'tenant-a',
+        createdAt: new Date().toISOString(),
+      });
+      await unscheduled.close();
+      return json({ id });
+    }
     if (url.pathname === '/admit') {
       const action = url.searchParams.get('action') ?? 'audit.admit';
       await this.audit.fireAsync(action, { actorId: 'worker-user', tenantId: 'tenant-a' });
@@ -96,6 +114,7 @@ export class AuditDO {
       const fresh = new CloudflareReliabilityAdapter({
         state: this.state,
         tablePrefix: 'audit_test',
+        scheduleAlarms: false,
       });
       await fresh.init();
       const maxBytes = url.searchParams.get('maxBytes');

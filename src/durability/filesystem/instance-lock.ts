@@ -686,17 +686,38 @@ export class InstanceLock {
   }
 
   async release(): Promise<void> {
-    if (!this.handle) return;
+    if (!this.handle && !this.ownedIdentity) return;
     const ownedHandle = this.handle;
     const ownedIdentity = this.ownedIdentity;
     this.handle = null;
-    this.ownedIdentity = null;
-    try {
-      await ownedHandle.close();
-    } catch {
-      /* continue with ownership-checked cleanup */
+    let closeError: unknown;
+    if (ownedHandle) {
+      try {
+        await ownedHandle.close();
+      } catch (error) {
+        closeError = error;
+      }
     }
-    if (!ownedIdentity) return;
-    await this.cleanupCreatedPath(this.path, ownedIdentity);
+    if (!ownedIdentity) {
+      if (closeError !== undefined) throw closeError;
+      return;
+    }
+    try {
+      await this.removePathIfSame(this.path, ownedIdentity);
+      // The canonical path was removed, was already absent, or now names a
+      // replacement inode. In every case this instance no longer owns it.
+      this.ownedIdentity = null;
+    } catch (unlinkError) {
+      // Retain the identity so a later release can retry ownership-checked
+      // removal. Acquisition rollback remains best-effort via cleanupCreatedPath.
+      if (closeError !== undefined) {
+        throw new AggregateError(
+          [closeError, unlinkError],
+          'instance lock handle close and owned unlink both failed',
+        );
+      }
+      throw unlinkError;
+    }
+    if (closeError !== undefined) throw closeError;
   }
 }

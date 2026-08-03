@@ -6,6 +6,8 @@
  * - rapid restart cycles
  */
 import { describe, expect, test } from 'bun:test';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { BunSQLiteAdapter } from '../src/adapters/bun-sqlite';
@@ -27,74 +29,83 @@ const { tempDataDir } = installTestCleanup();
 
 describe('e2e stress & production shape', () => {
   test('1000 durable fireAsync enqueues then full drain and count', async () => {
-    const dataDir = await tempDataDir('logbun-e2e-1k-');
+    // This case owns cleanup instead of registering with the shared afterEach:
+    // a runner timeout must not remove storage under still-settling admissions.
+    const dataDir = await mkdtemp(join(tmpdir(), 'logbun-e2e-1k-'));
     const N = 1_000;
-    const audit = new AuditLogger<Actions>({
-      ...ENTERPRISE_DEFAULTS,
-      namespace: 'e2e-1k',
-      reliability: makeFileReliability('e2e-1k', dataDir),
-      adapter: new BunSQLiteAdapter({
-        path: join(dataDir, 'bulk.db'),
-        synchronous: 'NORMAL',
-      }),
-      batching: { maxSize: 50, flushInterval: 50, maxQueueSize: 5_000 },
-      maxFlushConcurrency: 8,
-      retry: FAST_RETRY,
-    });
-    await audit.ready;
+    let audit: AuditLogger<Actions> | undefined;
+    let reader: AuditLogger<Actions> | undefined;
+    try {
+      audit = new AuditLogger<Actions>({
+        ...ENTERPRISE_DEFAULTS,
+        namespace: 'e2e-1k',
+        reliability: makeFileReliability('e2e-1k', dataDir),
+        adapter: new BunSQLiteAdapter({
+          path: join(dataDir, 'bulk.db'),
+          synchronous: 'NORMAL',
+        }),
+        batching: { maxSize: 50, flushInterval: 50, maxQueueSize: 5_000 },
+        maxFlushConcurrency: 8,
+        retry: FAST_RETRY,
+      });
+      await audit.ready;
 
-    const start = performance.now();
-    const batchSize = 50;
-    for (let offset = 0; offset < N; offset += batchSize) {
-      const chunk: Promise<void>[] = [];
-      for (let i = offset; i < Math.min(offset + batchSize, N); i++) {
-        chunk.push(
-          audit.fireAsync('evt.a', {
-            tenantId: `t${i % 10}`,
-            actorId: `actor-${i % 20}`,
-            entityId: `e-${i}`,
-            newValues: { i },
-          }),
-        );
+      const start = performance.now();
+      const batchSize = 50;
+      for (let offset = 0; offset < N; offset += batchSize) {
+        const chunk: Promise<void>[] = [];
+        for (let i = offset; i < Math.min(offset + batchSize, N); i++) {
+          chunk.push(
+            audit.fireAsync('evt.a', {
+              tenantId: `t${i % 10}`,
+              actorId: `actor-${i % 20}`,
+              entityId: `e-${i}`,
+              newValues: { i },
+            }),
+          );
+        }
+        await Promise.all(chunk);
       }
-      await Promise.all(chunk);
-    }
-    const enqueueMs = performance.now() - start;
+      const enqueueMs = performance.now() - start;
 
-    await audit.shutdown();
-    const totalMs = performance.now() - start;
+      await audit.shutdown();
+      const totalMs = performance.now() - start;
 
-    const reader = new AuditLogger<Actions>({
-      namespace: 'e2e-1k-r',
-      mode: 'volatile',
-      requireTenantId: true,
-      dataDir: join(dataDir, 'r'),
-      adapter: new BunSQLiteAdapter({ path: join(dataDir, 'bulk.db') }),
-      batching: FAST_BATCH,
-      retry: FAST_RETRY,
-    });
-    await reader.ready;
+      reader = new AuditLogger<Actions>({
+        namespace: 'e2e-1k-r',
+        mode: 'volatile',
+        requireTenantId: true,
+        dataDir: join(dataDir, 'r'),
+        adapter: new BunSQLiteAdapter({ path: join(dataDir, 'bulk.db') }),
+        batching: FAST_BATCH,
+        retry: FAST_RETRY,
+      });
+      await reader.ready;
 
-    let total = 0;
-    for (let t = 0; t < 10; t++) {
-      let cursor: string | undefined;
-      for (;;) {
-        const page = await reader.query({
-          tenantId: `t${t}`,
-          pagination: { limit: 200, cursor },
-        });
-        total += page.logs.length;
-        if (!page.nextCursor) break;
-        cursor = page.nextCursor;
+      let total = 0;
+      for (let t = 0; t < 10; t++) {
+        let cursor: string | undefined;
+        for (;;) {
+          const page = await reader.query({
+            tenantId: `t${t}`,
+            pagination: { limit: 200, cursor },
+          });
+          total += page.logs.length;
+          if (!page.nextCursor) break;
+          cursor = page.nextCursor;
+        }
       }
-    }
 
-    expect(total).toBe(N);
-    // Sanity: should complete in reasonable time on CI/dev machines
-    expect(totalMs).toBeLessThan(60_000);
-    expect(enqueueMs).toBeLessThan(60_000);
-    await reader.shutdown();
-  });
+      expect(total).toBe(N);
+      // Sanity: should complete in reasonable time on CI/dev machines
+      expect(totalMs).toBeLessThan(60_000);
+      expect(enqueueMs).toBeLessThan(60_000);
+    } finally {
+      await reader?.shutdown().catch(() => undefined);
+      await audit?.shutdown().catch(() => undefined);
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  }, 70_000);
 
   test('getStats and getStatsDetailed remain consistent under concurrent fire', async () => {
     const dataDir = await tempDataDir('logbun-e2e-stats-');

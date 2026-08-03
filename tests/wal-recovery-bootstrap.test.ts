@@ -61,18 +61,15 @@ test('bootstrap durable recovery keeps WAL until flush acknowledges', async () =
     reliability,
     mode: 'durable',
     adapter,
-    batching: { maxSize: 100, flushInterval: 30, maxQueueSize: 1000, onQueueFull: 'dlq' },
+    batching: { maxSize: 100, flushInterval: 60_000, maxQueueSize: 1000, onQueueFull: 'dlq' },
   });
 
   // Immediately after bootstrap, journal must still contain recovered ids
   const afterBoot = await engine.reliability.recoverJournal();
   expect(afterBoot.logs.map((l) => l.id).sort()).toEqual(['boot-1', 'boot-2']);
 
-  // Drain via scheduled recovery flush
-  const start = Date.now();
-  while (inserts.length < 2 && Date.now() - start < 2_000) {
-    await new Promise((r) => setTimeout(r, 20));
-  }
+  // Drain only after the pre-flush WAL assertion above has completed.
+  await engine.batcher.flushAll();
   expect(inserts.map((l) => l.id).sort()).toEqual(['boot-1', 'boot-2']);
 
   // After successful flush + acknowledge, journal should no longer hold those ids

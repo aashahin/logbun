@@ -1,5 +1,6 @@
 import type { DLQStorageOptions } from './dlq';
 import type { WALStorageOptions } from './wal';
+import type { InstanceLockOptions } from './instance-lock';
 
 /** @internal Source-test seams; this module is not a package export. */
 export interface FileReliabilityAdapterTestHooks {
@@ -7,6 +8,7 @@ export interface FileReliabilityAdapterTestHooks {
   dlqDirectorySync?: DLQStorageOptions['directorySync'];
   afterLockAcquire?: () => void | Promise<void>;
   beforeStorageClose?: () => void | Promise<void>;
+  instanceLockOptions?: InstanceLockOptions;
 }
 
 const hooksByOptions = new WeakMap<object, FileReliabilityAdapterTestHooks>();

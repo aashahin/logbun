@@ -324,3 +324,32 @@ test('close releases the namespace lock even when WAL close fails', async () => 
   await expect(successor.init()).resolves.toBeUndefined();
   await successor.close();
 });
+
+test('close retains a failed lock release for retry before permitting a successor', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-adapter-release-retry-'));
+  cleanupPaths.push(dataDir);
+  const namespace = 'adapter-release-retry';
+  let failRelease = true;
+  const options = { namespace, dataDir };
+  setFileReliabilityAdapterTestHooks(options, {
+    instanceLockOptions: {
+      afterOwnedUnlinkCheck: () => {
+        if (!failRelease) return;
+        const error = new Error('simulated adapter lock release failure') as NodeJS.ErrnoException;
+        error.code = 'EIO';
+        throw error;
+      },
+    },
+  });
+  const adapter = new FileReliabilityAdapter(options);
+  await adapter.init();
+
+  await expect(adapter.close()).rejects.toThrow(/adapter lock release failure/);
+  const successor = new FileReliabilityAdapter({ namespace, dataDir });
+  await expect(successor.init()).rejects.toThrow(/instance_lock_held/);
+
+  failRelease = false;
+  await expect(adapter.close()).resolves.toBeUndefined();
+  await expect(successor.init()).resolves.toBeUndefined();
+  await successor.close();
+});

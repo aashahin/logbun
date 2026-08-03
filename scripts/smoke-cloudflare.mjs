@@ -56,9 +56,20 @@ try {
 
   await createMiniflare();
 
-  // Admit, intentionally remove the alarm, then tear down the entire workerd
-  // isolate. The next instance must discover persisted work and restore it.
-  await request('/admit?action=journal');
+  // Seed bounded-recovery state without scheduling an alarm, then tear down
+  // the entire workerd isolate. The next instance must discover persisted work
+  // and restore a real alarm through its normal adapter initialization.
+  await request('/admit-unscheduled?action=journal');
+  await waitForCondition(
+    'unscheduled bounded-recovery fixture was not stable',
+    async () => {
+      const state = await request('/state');
+      return {
+        done: state.journalRows === 1 && state.alarm == null,
+        value: state,
+      };
+    },
+  );
   const strictBound = await request('/recovery?maxBytes=1');
   if (strictBound.ids.length !== 0 || strictBound.truncated !== true) {
     throw new Error('DO recovery returned a record larger than maxBytes');
