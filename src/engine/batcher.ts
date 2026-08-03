@@ -74,6 +74,12 @@ export type RecoveryWaveLoader = () => Promise<{
   truncated: boolean;
 }>;
 
+type DurableAppendResult =
+  | 'ok'
+  | 'dlq'
+  | 'fail'
+  | { state: 'ok'; committedSchedulingError: unknown };
+
 /**
  * Batching Engine — per-tenant in-memory queues with backpressure.
  *
@@ -85,6 +91,8 @@ export type RecoveryWaveLoader = () => Promise<{
  */
 export class Batcher {
   private readonly queues: Map<string, LogbunLog[]> = new Map();
+  /** Keeps an admitted tenant key owned across pre-admission awaits. */
+  private readonly queuePins: Map<string, number> = new Map();
   private readonly timers: Map<string, ReturnType<typeof setTimeout>> =
     new Map();
   /** Reserved slots awaiting WAL append (sync admit, before any await). */
@@ -250,45 +258,79 @@ export class Batcher {
       return false;
     }
 
-    let queue = this.getOrCreateQueue(key);
-
-    if (!(await this.admitUnderBackpressure(key, queue, tenantId))) {
-      this.maybePruneQueue(key);
-      return false;
-    }
-
-    if (!(await this.admitGlobalCap(key, tenantId))) {
-      this.maybePruneQueue(key);
-      return false;
-    }
-
-    // Either pre-admission spill may prune an emptied queue key. Reacquire the
-    // live queue before reserving/pushing so the current log cannot enter a
-    // detached array that is no longer tracked by the batcher.
-    queue = this.getOrCreateQueue(key);
-    this.reserve(key);
+    const queue = this.getOrCreateQueue(key);
+    this.pinQueue(key);
     try {
-      const durable = await this.appendDurable(log, tenantId);
-      if (durable === 'dlq') {
-        // WAL failed but DLQ holds the log — do not also queue
-        return true;
-      }
-      if (durable === 'fail') {
+      if (!(await this.admitUnderBackpressure(key, queue, tenantId))) {
         return false;
       }
 
-      if (!(await this.ensureQueueRoom(key, queue, tenantId))) {
-        // WAL already holds the log in durable mode — escalate to DLQ so
-        // the live process can retry (do not leave it stranded until restart).
-        return this.persistSingleAfterRoomFail(log, tenantId);
+      if (!(await this.admitGlobalCap(key, tenantId))) {
+        return false;
       }
 
-      queue.push(log);
-      this.emit({ type: 'enqueue', tenantId, count: 1 });
-      this.armFlush(key, queue);
-      return true;
+      this.reserve(key);
+      try {
+        const durable = await this.appendDurable(log, tenantId);
+        const committedSchedulingError =
+          typeof durable === 'object'
+            ? durable.committedSchedulingError
+            : undefined;
+        if (durable === 'dlq') {
+          // WAL failed but DLQ holds the log — do not also queue
+          return true;
+        }
+        if (durable === 'fail') {
+          return false;
+        }
+
+        if (!(await this.ensureQueueRoom(key, queue, tenantId))) {
+          // WAL already holds the log in durable mode — escalate to DLQ so
+          // the live process can retry (do not leave it stranded until restart).
+          let admitted: boolean;
+          try {
+            admitted = await this.persistSingleAfterRoomFail(log, tenantId);
+          } catch (error) {
+            if (
+              committedSchedulingError !== undefined &&
+              isDurableAdmissionSchedulingError(error)
+            ) {
+              // The current record is now durably represented in the DLQ. Keep
+              // that later scheduling debt for maintenance, but preserve the
+              // exact WAL scheduling marker already owed to this caller.
+              this.retainCommittedSchedulingError(
+                error,
+                tenantId,
+                'current_queue_room_fallback',
+              );
+              throw committedSchedulingError;
+            }
+            throw error;
+          }
+          if (!admitted && committedSchedulingError !== undefined) {
+            // Both room-making DLQ attempts failed before commit. The WAL is
+            // still authoritative, but this instance must also remember the
+            // record so maintenance can admit it after the filler drains.
+            this.recoveryBacklog.push(log);
+          }
+          if (committedSchedulingError !== undefined) {
+            throw committedSchedulingError;
+          }
+          return admitted;
+        }
+
+        queue.push(log);
+        this.emit({ type: 'enqueue', tenantId, count: 1 });
+        this.armFlush(key, queue);
+        if (committedSchedulingError !== undefined) {
+          throw committedSchedulingError;
+        }
+        return true;
+      } finally {
+        this.releaseReserve(key);
+      }
     } finally {
-      this.releaseReserve(key);
+      this.unpinQueue(key);
       this.maybePruneQueue(key);
     }
   }
@@ -664,6 +706,7 @@ export class Batcher {
       this.recoveryBacklog.length > 0 ||
       this.hasQueuedRecoveryWork() ||
       this.inflightFlushes > 0 ||
+      this.queuePins.size > 0 ||
       this.inflightReservations.size > 0
     ) {
       return false;
@@ -674,11 +717,12 @@ export class Batcher {
       try {
         const reservationEpoch = this.reservationEpoch;
         const wave = await this.recoveryLoader!();
-        // A live enqueue can reserve and append while the adapter read is
-        // awaited. Discard that snapshot and reload after reservations settle;
-        // otherwise the appended record could be injected here and queued a
-        // second time when its live enqueue resumes.
+        // A live enqueue can pin its tenant or reserve and append while the
+        // adapter read is awaited. Discard that snapshot and reload after the
+        // admission settles; otherwise a still-unacknowledged record could be
+        // injected here and queued a second time when its live path resumes.
         if (
+          this.queuePins.size > 0 ||
           this.inflightReservations.size > 0 ||
           this.reservationEpoch !== reservationEpoch
         ) {
@@ -946,7 +990,14 @@ export class Batcher {
         this.emit({ type: 'drop', tenantId, count: 1, detail: 'queue_full' });
         return false;
       }
-      if (!(await this.dumpQueueToDlq(key, queue, tenantId))) {
+      if (
+        !(await this.dumpPriorQueueToDlq(
+          key,
+          queue,
+          tenantId,
+          'post_admission_queue_room',
+        ))
+      ) {
         // dumpQueueToDlq already emits dlq_full when applicable
         this.emit({ type: 'drop', tenantId, count: 1, detail: 'dlq_fail' });
         return false;
@@ -1005,19 +1056,23 @@ export class Batcher {
   /**
    * Durable WAL append with DLQ fallback on failure.
    * - ok: WAL written (or volatile / no WAL)
+   * - { state: 'ok', committedSchedulingError }: WAL written; continue live
+   *   admission, then return that exact host scheduling failure to the caller
    * - dlq: WAL failed, single-log DLQ succeeded (do not queue)
    * - fail: both failed (caller returns false from enqueue)
    */
   private async appendDurable(
     log: LogbunLog,
     tenantId: string | null
-  ): Promise<'ok' | 'dlq' | 'fail'> {
+  ): Promise<DurableAppendResult> {
     if (this.mode !== 'durable' || !this.reliability.persistent) return 'ok';
     try {
       await this.reliability.appendJournal(log);
       return 'ok';
     } catch (err) {
-      if (isDurableAdmissionSchedulingError(err)) throw err;
+      if (isDurableAdmissionSchedulingError(err)) {
+        return { state: 'ok', committedSchedulingError: err };
+      }
       const walMsg = err instanceof Error ? err.message : String(err);
       const walFull = walMsg.includes('wal_full');
       try {
@@ -1304,10 +1359,25 @@ export class Batcher {
     if (!queue) return;
     if (
       queue.length === 0 &&
+      (this.queuePins.get(key) ?? 0) === 0 &&
       (this.inflightReservations.get(key) ?? 0) === 0 &&
       !this.timers.has(key)
     ) {
       this.queues.delete(key);
+    }
+  }
+
+  private pinQueue(key: string): void {
+    this.queuePins.set(key, (this.queuePins.get(key) ?? 0) + 1);
+  }
+
+  private unpinQueue(key: string): void {
+    const current = this.queuePins.get(key) ?? 0;
+    if (current <= 1) {
+      this.queuePins.delete(key);
+      if (this.queuePins.size === 0) this.scheduleRecoveryPump();
+    } else {
+      this.queuePins.set(key, current - 1);
     }
   }
 

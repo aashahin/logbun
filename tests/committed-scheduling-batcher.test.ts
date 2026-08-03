@@ -30,6 +30,10 @@ function faultingReliability(): {
   failAppendBeforeCommit: (error: unknown, action?: string) => void;
   failDlqBeforeCommit: (error: unknown, action?: string) => void;
   appendAttempts: () => readonly LogbunLog[];
+  holdAcknowledge: (id: string) => {
+    reached: Promise<void>;
+    release: () => void;
+  };
   holdAppend: (id: string) => {
     reached: Promise<void>;
     release: () => void;
@@ -44,13 +48,22 @@ function faultingReliability(): {
   let appendBeforeCommitFailure:
     | { error: unknown; action?: string }
     | undefined;
-  let dlqBeforeCommitFailure: { error: unknown; action?: string } | undefined;
+  const dlqBeforeCommitFailures: Array<{
+    error: unknown;
+    action?: string;
+  }> = [];
   let appendHold: {
     id: string;
     reached: () => void;
     wait: Promise<void>;
   } | null = null;
+  let acknowledgeHold: {
+    id: string;
+    reached: () => void;
+    wait: Promise<void>;
+  } | null = null;
   const appendJournal = memory.appendJournal.bind(memory);
+  const acknowledgeJournal = memory.acknowledgeJournal.bind(memory);
   const writeDlq = memory.writeDlq.bind(memory);
   const reliability = new Proxy(memory, {
     get(target, property, receiver) {
@@ -68,7 +81,10 @@ function faultingReliability(): {
             throw error;
           }
           await appendJournal(entry);
-          if (appendHold?.id === entry.id) {
+          if (
+            appendHold &&
+            (appendHold.id === entry.id || appendHold.id === entry.action)
+          ) {
             const hold = appendHold;
             appendHold = null;
             hold.reached();
@@ -82,6 +98,7 @@ function faultingReliability(): {
       }
       if (property === 'writeDlq') {
         return async (tenantId: string | null, entries: LogbunLog[]) => {
+          const dlqBeforeCommitFailure = dlqBeforeCommitFailures[0];
           if (
             dlqBeforeCommitFailure !== undefined &&
             (dlqBeforeCommitFailure.action === undefined ||
@@ -90,7 +107,7 @@ function faultingReliability(): {
               ))
           ) {
             const { error } = dlqBeforeCommitFailure;
-            dlqBeforeCommitFailure = undefined;
+            dlqBeforeCommitFailures.shift();
             throw error;
           }
           const id = await writeDlq(tenantId, entries);
@@ -99,6 +116,17 @@ function faultingReliability(): {
             throw error;
           }
           return id;
+        };
+      }
+      if (property === 'acknowledgeJournal') {
+        return async (ids: string[]) => {
+          if (acknowledgeHold && ids.includes(acknowledgeHold.id)) {
+            const hold = acknowledgeHold;
+            acknowledgeHold = null;
+            hold.reached();
+            await hold.wait;
+          }
+          await acknowledgeJournal(ids);
         };
       }
       const value = Reflect.get(target, property, receiver);
@@ -114,9 +142,21 @@ function faultingReliability(): {
       appendBeforeCommitFailure = { error, action };
     },
     failDlqBeforeCommit: (error, action) => {
-      dlqBeforeCommitFailure = { error, action };
+      dlqBeforeCommitFailures.push({ error, action });
     },
     appendAttempts: () => attemptedAppends,
+    holdAcknowledge: (id) => {
+      let reachedResolve!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        reachedResolve = resolve;
+      });
+      let release!: () => void;
+      const wait = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      acknowledgeHold = { id, reached: reachedResolve, wait };
+      return { reached, release };
+    },
     holdAppend: (id) => {
       let reachedResolve!: () => void;
       const reached = new Promise<void>((resolve) => {
@@ -567,7 +607,9 @@ test.each(preAdmissionAttributionCases)(
         detail: `pre_admission_${pressure.replace('-', '_')}`,
       }),
     );
-    expect(audit.getStats().queued).toBe(outcome === 'succeeds' ? 1 : 0);
+    expect(audit.getStats().queued).toBe(
+      outcome === 'fails-precommit' ? 0 : 1,
+    );
 
     const observedMaintenance = await audit.runMaintenance().then(
       () => null,
@@ -591,13 +633,6 @@ test.each(preAdmissionAttributionCases)(
 
     await expect(audit.runMaintenance()).resolves.toBeUndefined();
     expect(rearmCalls).toBe(2);
-    if (outcome === 'commits-then-scheduling-fails') {
-      const recoveryBatcher = batcherFor(reliability, destination);
-      recoveryBatcher.injectRecovered(
-        (await reliability.recoverJournal()).logs as LogbunLog[],
-      );
-      await recoveryBatcher.flushAll();
-    }
     expect(destination.inserted.map((entry) => entry.id).sort()).toEqual(
       [oldId, deliverableCurrentId].sort(),
     );
@@ -612,6 +647,288 @@ test.each(preAdmissionAttributionCases)(
     await audit.shutdown();
   },
 );
+
+test.each([{ rearm: 'absent' }, { rearm: 'failing' }] as const)(
+  'current WAL scheduling marker stays exact and same-instance maintenance delivers once with $rearm rearm',
+  async ({ rearm }) => {
+    const { reliability, arm, appendAttempts } = faultingReliability();
+    const rearmError = new Error('maintenance rearm failed');
+    let rearmCalls = 0;
+    if (rearm === 'failing') {
+      Object.assign(reliability, {
+        async requestMaintenance() {
+          rearmCalls++;
+          if (rearmCalls === 1) throw rearmError;
+        },
+      });
+    }
+    const destination = memoryAdapter();
+    const audit = new AuditLogger({
+      namespace: `current-postcommit-${rearm}`,
+      mode: 'durable',
+      reliability,
+      adapter: destination,
+      batching: {
+        maxSize: 10,
+        flushInterval: 60_000,
+        maxQueueSize: 100,
+        onQueueFull: 'dlq',
+      },
+      retry: { insertMaxRetries: 1, insertBaseDelayMs: 0 },
+    });
+    await audit.ready;
+    const committedError = new DurableAdmissionSchedulingError(
+      new Error(`current ${rearm} rearm alarm EIO`),
+    );
+    arm('appendJournal', committedError);
+
+    const observedAdmission = await audit
+      .fireAsync(`current.postcommit.${rearm}`, { actorId: 'current' })
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+    const currentId = appendAttempts().at(-1)!.id;
+    expect(observedAdmission).toBe(committedError);
+    expect(audit.getStats().queued).toBe(1);
+    expect(
+      (await reliability.recoverJournal()).logs.map((entry) => entry.id),
+    ).toEqual([currentId]);
+
+    const observedMaintenance = await audit.runMaintenance().then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(observedMaintenance).toBe(rearm === 'failing' ? rearmError : null);
+    expect(destination.inserted.map((entry) => entry.id)).toEqual([currentId]);
+    expect(audit.getStats().queued).toBe(0);
+    expect((await reliability.recoverJournal()).logs).toEqual([]);
+
+    await expect(audit.runMaintenance()).resolves.toBeUndefined();
+    expect(destination.inserted.map((entry) => entry.id)).toEqual([currentId]);
+    expect(rearmCalls).toBe(rearm === 'failing' ? 2 : 0);
+    await audit.shutdown();
+  },
+);
+
+test('current WAL scheduling marker survives two pre-commit room failures and same-instance maintenance drains once', async () => {
+  const {
+    reliability,
+    arm,
+    failDlqBeforeCommit,
+    appendAttempts,
+    holdAppend,
+  } = faultingReliability();
+  const destination = memoryAdapter();
+  const audit = new AuditLogger({
+    namespace: 'current-postcommit-room-failures',
+    mode: 'durable',
+    reliability,
+    adapter: destination,
+    batching: {
+      maxSize: 10,
+      flushInterval: 60_000,
+      maxQueueSize: 1,
+      onQueueFull: 'dlq',
+    },
+    retry: { insertMaxRetries: 1, insertBaseDelayMs: 0 },
+  });
+  await audit.ready;
+  const currentAction = 'current.postcommit.room-failures';
+  const fillerAction = 'filler.postcommit.room-failures';
+  const hold = holdAppend(currentAction);
+  const currentAdmission = audit.fireAsync(currentAction, {
+    actorId: 'current',
+  });
+  await hold.reached;
+  await audit.fireAsync(fillerAction, { actorId: 'filler' });
+  failDlqBeforeCommit(
+    new Error('filler spill failed before commit'),
+    fillerAction,
+  );
+  failDlqBeforeCommit(
+    new Error('current fallback failed before commit'),
+    currentAction,
+  );
+  const committedError = new DurableAdmissionSchedulingError(
+    new Error('current WAL alarm EIO before room failures'),
+  );
+  arm('appendJournal', committedError);
+  hold.release();
+
+  const observedAdmission = await currentAdmission.then(
+    () => null,
+    (error: unknown) => error,
+  );
+  const currentId = appendAttempts().find(
+    (entry) => entry.action === currentAction,
+  )!.id;
+  const fillerId = appendAttempts().find(
+    (entry) => entry.action === fillerAction,
+  )!.id;
+  expect(observedAdmission).toBe(committedError);
+  expect(audit.getStats()).toEqual(
+    expect.objectContaining({ queued: 1, recoveryBacklog: 1 }),
+  );
+  expect(
+    (await reliability.recoverJournal()).logs.map((entry) => entry.id).sort(),
+  ).toEqual([currentId, fillerId].sort());
+  expect(await reliability.listDlq()).toEqual([]);
+
+  await expect(audit.runMaintenance()).resolves.toBeUndefined();
+  await expect(audit.runMaintenance()).resolves.toBeUndefined();
+  expect(destination.inserted.map((entry) => entry.id).sort()).toEqual(
+    [currentId, fillerId].sort(),
+  );
+  expect(new Set(destination.inserted.map((entry) => entry.id)).size).toBe(2);
+  expect((await reliability.recoverJournal()).logs).toEqual([]);
+  expect(await reliability.listDlq()).toEqual([]);
+  await audit.shutdown();
+});
+
+test('maxActiveTenants keeps the current key owned while an older spill awaits acknowledgement', async () => {
+  const { reliability, arm, appendAttempts, holdAcknowledge } =
+    faultingReliability();
+  await reliability.init();
+  const destination = memoryAdapter();
+  const batcher = new Batcher({
+    reliability,
+    adapter: destination,
+    pool: new ConnectionPool(destination, 5),
+    mode: 'durable',
+    batching: {
+      maxSize: 10,
+      flushInterval: 60_000,
+      maxQueueSize: 1,
+      onQueueFull: 'dlq',
+    },
+    maxActiveTenants: 1,
+    retry: { insertMaxRetries: 1, insertBaseDelayMs: 0 },
+  });
+  await batcher.enqueue(log('tenant-a-older', 'tenant-a'));
+  const olderId = appendAttempts().at(-1)!.id;
+  const hold = holdAcknowledge(olderId);
+  const priorError = new DurableAdmissionSchedulingError(
+    new Error('tenant-a older spill alarm EIO'),
+  );
+  arm('writeDlq', priorError);
+
+  const currentAdmission = batcher.enqueue(
+    log('tenant-a-current', 'tenant-a'),
+  );
+  await hold.reached;
+  const competingAdmission = await batcher.enqueue(
+    log('tenant-b-competing', 'tenant-b'),
+  );
+  hold.release();
+  const admittedCurrent = await currentAdmission;
+
+  expect(competingAdmission).toBe(false);
+  expect(admittedCurrent).toBe(true);
+  expect(batcher.getStats()).toEqual(
+    expect.objectContaining({ tenants: 1, queued: 1 }),
+  );
+  expect(appendAttempts().map((entry) => entry.id)).toEqual([
+    'tenant-a-older',
+    'tenant-a-current',
+  ]);
+  expect(
+    (await reliability.recoverJournal()).logs.map((entry) => entry.id),
+  ).toEqual(['tenant-a-current']);
+  const pending = await reliability.listDlq();
+  expect(pending).toEqual([
+    expect.objectContaining({ tenantId: 'tenant-a', logCount: 1 }),
+  ]);
+  expect(
+    (await reliability.readDlq(pending[0]!.id))?.logs.map((entry) => entry.id),
+  ).toEqual(['tenant-a-older']);
+
+  const observedDebt = await batcher.flushAll().then(
+    () => null,
+    (error: unknown) => error,
+  );
+  expect(observedDebt).toBe(priorError);
+  await expect(batcher.flushAll()).resolves.toBeUndefined();
+  const retry = new RetryEngine({
+    reliability,
+    adapter: destination,
+    pool: new ConnectionPool(destination, 5),
+    retry: { insertMaxRetries: 1, insertBaseDelayMs: 0 },
+  });
+  await retry.scan();
+  expect(destination.inserted.map((entry) => entry.id).sort()).toEqual([
+    'tenant-a-current',
+    'tenant-a-older',
+  ]);
+  expect(new Set(destination.inserted.map((entry) => entry.id)).size).toBe(2);
+  expect((await reliability.recoverJournal()).logs).toEqual([]);
+  expect(await reliability.listDlq()).toEqual([]);
+  expect(batcher.getStats().tenants).toBe(0);
+
+  await expect(
+    batcher.enqueue(log('tenant-b-after-pin-release', 'tenant-b')),
+  ).resolves.toBe(true);
+  await batcher.flushAll();
+  expect(destination.inserted.map((entry) => entry.id).sort()).toEqual([
+    'tenant-a-current',
+    'tenant-a-older',
+    'tenant-b-after-pin-release',
+  ]);
+});
+
+test('maintenance does not reinject an unacknowledged journal row while its tenant key is pinned', async () => {
+  const { reliability, appendAttempts, holdAcknowledge } =
+    faultingReliability();
+  await reliability.init();
+  await reliability.appendJournal(log('pinned-recovered-older', 'tenant-a'));
+  await reliability.appendJournal(log('recovery-sentinel', 'tenant-b'));
+  const destination = memoryAdapter();
+  const audit = new AuditLogger({
+    namespace: 'pinned-recovery-read',
+    mode: 'durable',
+    reliability,
+    adapter: destination,
+    maxRecoveryBatch: 1,
+    batching: {
+      maxSize: 10,
+      flushInterval: 60_000,
+      maxQueueSize: 1,
+      onQueueFull: 'dlq',
+    },
+    retry: { insertMaxRetries: 1, insertBaseDelayMs: 0 },
+  });
+  await audit.ready;
+  expect(audit.getStats()).toEqual(
+    expect.objectContaining({ queued: 1, recoveryBacklog: 0 }),
+  );
+  const hold = holdAcknowledge('pinned-recovered-older');
+  const currentAdmission = audit.fireAsync('pinned.current', {
+    actorId: 'current',
+    tenantId: 'tenant-a',
+  });
+  await hold.reached;
+
+  await audit.runMaintenance();
+  expect(destination.inserted.map((entry) => entry.id)).toEqual([
+    'pinned-recovered-older',
+  ]);
+  expect(await reliability.listDlq()).toEqual([]);
+
+  hold.release();
+  await expect(currentAdmission).resolves.toBeUndefined();
+  const currentId = appendAttempts().find(
+    (entry) => entry.action === 'pinned.current',
+  )!.id;
+  await audit.runMaintenance();
+  await audit.runMaintenance();
+  expect(destination.inserted.map((entry) => entry.id).sort()).toEqual(
+    ['pinned-recovered-older', 'recovery-sentinel', currentId].sort(),
+  );
+  expect(new Set(destination.inserted.map((entry) => entry.id)).size).toBe(3);
+  expect((await reliability.recoverJournal()).logs).toEqual([]);
+  expect(await reliability.listDlq()).toEqual([]);
+  await audit.shutdown();
+});
 
 test.each([
   {
