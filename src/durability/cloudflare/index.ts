@@ -13,3 +13,7 @@ export {
   type DurableObjectSqlStorage,
   type DurableObjectStateLike,
 } from './adapter';
+export {
+  DurableAdmissionSchedulingError,
+  isDurableAdmissionSchedulingError,
+} from '../../reliability/scheduling-error';

@@ -16,7 +16,7 @@ Subpaths:
 |---|---|
 | `ready` | Bootstrap promise. Bootstrap failure sets `degraded` and emits events. |
 | `fire(action, input, context?)` | Returns `void`, never throws. If provided, `context.waitUntil` receives the admission task, including pre-ready draining. |
-| `fireAsync(action, input, context?)` | Resolves after admission; in durable mode, journal commit occurs first. Rejects on hard admission failure. |
+| `fireAsync(action, input, context?)` | Resolves after admission; in durable mode, journal commit occurs first. Rejects on hard admission failure. Cloudflare alarm scheduling can also reject after commit with `DurableAdmissionSchedulingError`. |
 | `flush()` | Drains current RAM queues and compacts safely. |
 | `runMaintenance()` | Single-flight: flushes, scans the DLQ once, and prunes configured retention. |
 | `retryDlqNow()` | One DLQ scan without flush or retention. |
@@ -54,6 +54,31 @@ The minimal methods are `init`, `close`, `appendJournal`,
 `acknowledgeJournal`, `recoverJournal`, `compactJournal`, `writeDlq`,
 `listDlq`, `claimDlq`, settlement/poison/requeue/delete methods,
 `readDlq`, `recoverOrphans`, and `getStats`.
+
+Host-scheduled implementations may expose `pendingMaintenanceDelayMs()` and
+`requestMaintenance()`. `AuditLogger.runMaintenance()` calls
+`requestMaintenance()` after every pass so pending reliability work retains a
+wake-up; the deprecated `rearmMaintenance()` hook remains a compatibility
+fallback.
+
+Cloudflare journal admission surfaces alarm-read/write failures after the
+journal row is committed. The exported error and cross-entrypoint-safe guard
+let callers distinguish this from a failed commit:
+
+```ts
+import { isDurableAdmissionSchedulingError } from 'logbun';
+
+try {
+  await audit.fireAsync('audit.event', input);
+} catch (error) {
+  if (isDurableAdmissionSchedulingError(error)) {
+    // The event is durable already. Restore maintenance; do not resubmit it.
+    await reliability.requestMaintenance();
+  } else {
+    throw error;
+  }
+}
+```
 
 ```ts
 interface DLQEntry {

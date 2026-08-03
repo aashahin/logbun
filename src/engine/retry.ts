@@ -80,16 +80,27 @@ export class RetryEngine {
     if (this.running) return;
     this.running = true;
     try {
+      // A storage failure after claim can leave an entry in processing. Every
+      // host-driven pass is a recovery boundary, not just process bootstrap.
+      await this.reliability.recoverOrphans();
       const pending = await this.reliability.listDlq({
         includePending: true,
         includeProcessing: false,
         includeDead: false,
       });
+      const failures: unknown[] = [];
       for (let i = 0; i < pending.length; i += PROCESS_CONCURRENCY) {
         const chunk = pending.slice(i, i + PROCESS_CONCURRENCY);
-        await Promise.allSettled(
+        const results = await Promise.allSettled(
           chunk.map((entry) => this.processBatch(entry.id))
         );
+        for (const result of results) {
+          if (result.status === 'rejected') failures.push(result.reason);
+        }
+      }
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) {
+        throw new AggregateError(failures, 'multiple DLQ retry batches failed');
       }
     } finally {
       this.running = false;
@@ -97,64 +108,51 @@ export class RetryEngine {
   }
 
   private async processBatch(id: string): Promise<void> {
-    let claimed;
-    try {
-      claimed = await this.reliability.claimDlq(id);
-    } catch {
-      return;
-    }
+    const claimed = await this.reliability.claimDlq(id);
     if (!claimed) return;
 
     const { tenantId, logs } = claimed;
-    let attempts = claimed.attempts;
+    const attempts = claimed.attempts;
 
-    try {
-      if (attempts >= this.maxScanAttempts) {
-        await this.poison(claimed.id, tenantId, attempts, id);
-        return;
-      }
+    if (attempts >= this.maxScanAttempts) {
+      await this.poison(claimed.id, tenantId, attempts, id);
+      return;
+    }
 
-      if (!Array.isArray(logs) || logs.length === 0) {
-        await this.poison(claimed.id, tenantId, attempts, 'empty_or_invalid');
-        return;
-      }
+    if (!Array.isArray(logs) || logs.length === 0) {
+      await this.poison(claimed.id, tenantId, attempts, 'empty_or_invalid');
+      return;
+    }
 
-      const insertResult = await this.insertWithAdapter(
+    const insertResult = await this.insertWithAdapter(
+      tenantId,
+      claimed.id,
+      attempts,
+      logs
+    );
+    if (!insertResult) return;
+
+    const { ok, error } = insertResult;
+    if (ok) {
+      await this.reliability.settleDlqSuccess(claimed.id);
+      this.emit({
+        type: 'flush_ok',
         tenantId,
-        claimed.id,
-        attempts,
-        logs
-      );
-      if (!insertResult) return;
+        count: logs.length,
+        detail: 'dlq_retry',
+      });
+      return;
+    }
 
-      const { ok, error } = insertResult;
-      if (ok) {
-        await this.reliability.settleDlqSuccess(claimed.id);
-        this.emit({
-          type: 'flush_ok',
-          tenantId,
-          count: logs.length,
-          detail: 'dlq_retry',
-        });
-        return;
-      }
-
-      await this.failWithAttempts(claimed.id, attempts);
-      if (error) {
-        this.emit({
-          type: 'flush_fail',
-          tenantId,
-          count: logs.length,
-          error,
-          detail: 'dlq_retry',
-        });
-      }
-    } catch {
-      try {
-        await this.failWithAttempts(claimed.id, attempts);
-      } catch {
-        // nothing we can do
-      }
+    await this.failWithAttempts(claimed.id, attempts);
+    if (error) {
+      this.emit({
+        type: 'flush_fail',
+        tenantId,
+        count: logs.length,
+        error,
+        detail: 'dlq_retry',
+      });
     }
   }
 
@@ -215,27 +213,19 @@ export class RetryEngine {
     attempts: number,
     detail: string
   ): Promise<void> {
-    try {
-      await this.reliability.poisonDlq(id);
-      this.emit({
-        type: 'poison',
-        tenantId,
-        count: attempts,
-        detail,
-      });
-    } catch {
-      // ignore
-    }
+    await this.reliability.poisonDlq(id);
+    this.emit({
+      type: 'poison',
+      tenantId,
+      count: attempts,
+      detail,
+    });
   }
 
   private async failWithAttempts(
     id: string,
     currentAttempts: number
   ): Promise<void> {
-    try {
-      await this.reliability.settleDlqFailure(id, currentAttempts + 1);
-    } catch {
-      // filesystem / storage error
-    }
+    await this.reliability.settleDlqFailure(id, currentAttempts + 1);
   }
 }

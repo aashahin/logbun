@@ -6,6 +6,7 @@ export interface FileReliabilityAdapterTestHooks {
   walDirectorySync?: WALStorageOptions['directorySync'];
   dlqDirectorySync?: DLQStorageOptions['directorySync'];
   afterLockAcquire?: () => void | Promise<void>;
+  beforeStorageClose?: () => void | Promise<void>;
 }
 
 const hooksByOptions = new WeakMap<object, FileReliabilityAdapterTestHooks>();

@@ -48,6 +48,10 @@ export { ENTERPRISE_DEFAULTS } from './types';
 // ─── In-memory reliability (volatile default) ────────────────────────────────
 export { MemoryReliabilityAdapter } from './reliability/memory';
 export type { MemoryReliabilityOptions } from './reliability/memory';
+export {
+  DurableAdmissionSchedulingError,
+  isDurableAdmissionSchedulingError,
+} from './reliability/scheduling-error';
 
 // ─── Pure helpers (no node:/bun:/process) ────────────────────────────────────
 export { sanitizeNamespace } from './utils/namespace';

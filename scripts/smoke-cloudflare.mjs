@@ -16,6 +16,21 @@ async function request(path) {
   return response.json();
 }
 
+async function waitForCondition(description, probe, timeoutMs = 5_000, intervalMs = 25) {
+  const deadline = Date.now() + timeoutMs;
+  let observation;
+  for (;;) {
+    observation = await probe();
+    if (observation.done) return observation.value;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `${description} timed out after ${timeoutMs}ms; last observation: ${JSON.stringify(observation.value)}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
 try {
   await build({
     absWorkingDir: root,
@@ -71,11 +86,16 @@ try {
   }
 
   // Actual alarm execution flushes the persisted journal and acknowledges it.
-  await new Promise((resolve) => setTimeout(resolve, 450));
-  const afterAlarm = await request('/state');
-  if (afterAlarm.delivered < 1 || afterAlarm.journalRows !== 0) {
-    throw new Error('recreated DO alarm did not run journal maintenance');
-  }
+  const afterAlarm = await waitForCondition(
+    'recreated DO alarm did not run journal maintenance',
+    async () => {
+      const state = await request('/state');
+      return {
+        done: state.delivered >= 1 && state.journalRows === 0,
+        value: state,
+      };
+    },
+  );
 
   // Persist a failed delivery in the DLQ, clear its alarm, and restart a
   // second time. The new isolate has a fresh destination instance.
@@ -98,12 +118,17 @@ try {
   if (!recoveredOrphans.some((entry) => entry.id === orphan.id && entry.state === 'pending')) {
     throw new Error('recreated DO did not recover persisted processing work');
   }
-  await new Promise((resolve) => setTimeout(resolve, 450));
-  const settled = await request('/dlq');
-  const afterDlqAlarm = await request('/state');
-  if (settled.length !== 0 || afterDlqAlarm.delivered < 2) {
-    throw new Error('recreated DO alarm did not settle persisted DLQ work');
-  }
+  await waitForCondition(
+    'recreated DO alarm did not settle persisted DLQ work',
+    async () => {
+      const settled = await request('/dlq');
+      const state = await request('/state');
+      return {
+        done: settled.length === 0 && state.delivered >= 2,
+        value: { settled, state },
+      };
+    },
+  );
 
   // Atomic claim and orphan recovery execute against real workerd SQLite.
   const atomic = await request('/atomic');
@@ -137,11 +162,16 @@ try {
     throw new Error('failed DO maintenance consumed its only pending-work alarm');
   }
   await request('/fail?value=false');
-  await new Promise((resolve) => setTimeout(resolve, 450));
-  const recoveredFailure = await request('/state');
-  if (recoveredFailure.delivered <= deliveredBeforeFailure || recoveredFailure.dlqPending !== 0) {
-    throw new Error('rearmed DO alarm did not retry and settle maintenance work');
-  }
+  await waitForCondition(
+    'rearmed DO alarm did not retry and settle maintenance work',
+    async () => {
+      const state = await request('/state');
+      return {
+        done: state.delivered > deliveredBeforeFailure && state.dlqPending === 0,
+        value: state,
+      };
+    },
+  );
 
   console.log('Cloudflare smoke OK (recreated workerd DO persistence, DLQ, alarm rearm/retry)');
 } finally {

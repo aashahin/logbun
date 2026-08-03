@@ -9,6 +9,7 @@ import type {
 } from '../types';
 import type { ConnectionPool } from './pool';
 import { safeEmit, type LogbunEventHandler } from '../events';
+import { isDurableAdmissionSchedulingError } from '../reliability/scheduling-error';
 
 const DEFAULT_BATCHING: BatchingConfig = {
   maxSize: 100,
@@ -910,6 +911,7 @@ export class Batcher {
       await this.reliability.appendJournal(log);
       return 'ok';
     } catch (err) {
+      if (isDurableAdmissionSchedulingError(err)) throw err;
       const walMsg = err instanceof Error ? err.message : String(err);
       const walFull = walMsg.includes('wal_full');
       try {

@@ -391,9 +391,13 @@ export class WALStorage {
 
     const dataDir = dirname(this.namespaceDir);
     const createdStart = this.providedHierarchyStart ?? this.createdDirectoryStart;
+    // mkdir only reports the first directory created to the object that did the
+    // creation. A replacement WAL cannot know where an abandoned hierarchy
+    // fsync failed, so without that marker it must conservatively republish all
+    // ancestors to the filesystem root before admitting writes.
     const outermostTarget = createdStart
       ? dirname(resolve(createdStart))
-      : dirname(dataDir);
+      : undefined;
     const hierarchy: Array<{
       directory: string;
       allowPermissionBoundary: boolean;
@@ -408,6 +412,7 @@ export class WALStorage {
       if (hierarchyDirectory === outermostTarget) break;
       const parent = dirname(hierarchyDirectory);
       if (parent === hierarchyDirectory) {
+        if (!outermostTarget) break;
         throw new Error('WAL created hierarchy escaped its configured data directory');
       }
       hierarchyDirectory = parent;

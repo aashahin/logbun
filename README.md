@@ -190,6 +190,12 @@ Standard Workers should call a DO binding. Use `fireAsync` + journal for
 admission that survives request end; do **not** treat detached volatile `fire()`
 as durable in isolate-scoped runtimes.
 
+If the DO journal commits but `getAlarm` / `setAlarm` fails, `fireAsync`
+rejects with `DurableAdmissionSchedulingError` and
+`durableAdmissionCommitted === true`. Do not resubmit that audit event; call
+`requestMaintenance()` after the scheduler recovers. Use the exported
+`isDurableAdmissionSchedulingError(error)` guard across package entrypoints.
+
 ### Hono `waitUntil`
 
 ```typescript
@@ -216,7 +222,8 @@ app.use('*', createAuditMiddleware(audit, { trustedProxyCount: 1 }));
 ## Production checklist
 
 1. `mode: 'durable'` + persistent reliability with **unique `namespace` per replica**
-2. Prefer `fireAsync` when callers must know admission succeeded
+2. Prefer `fireAsync` when callers must know admission succeeded; handle its
+   committed-but-unscheduled error as described above
 3. Schedule `runMaintenance()` (or DO `alarm`)
 4. On request-scoped volatile hosts: `await fireAsync(...); await flush()`
 5. Set `requireTenantId: true` (or use `ENTERPRISE_DEFAULTS`) for multi-tenant SaaS

@@ -16,6 +16,7 @@ import type {
   ReliabilityStats,
 } from '../../reliability/types';
 import { randomUUIDv7 } from '../../utils/uuidv7';
+import { DurableAdmissionSchedulingError } from '../../reliability/scheduling-error';
 
 /**
  * Structural subset of Cloudflare Durable Object SQLite storage.
@@ -173,7 +174,7 @@ export class CloudflareReliabilityAdapter implements ReliabilityAdapter {
     // example, after an isolate restart). Recover an interrupted claim before
     // looking at pending work, then restore the host maintenance wake-up.
     await this.recoverOrphans();
-    await this.maybeAlarm();
+    await this.requestMaintenance();
   }
 
   async close(): Promise<void> {
@@ -193,21 +194,26 @@ export class CloudflareReliabilityAdapter implements ReliabilityAdapter {
     return fn();
   }
 
-  private async maybeAlarm(): Promise<void> {
+  async requestMaintenance(): Promise<void> {
+    this.ensureReady();
     if (!this.scheduleAlarms || typeof this.storage.setAlarm !== 'function') {
       return;
     }
     const delay = await this.pendingMaintenanceDelayMs();
     if (delay == null) return;
+    const existing =
+      typeof this.storage.getAlarm === 'function'
+        ? await this.storage.getAlarm()
+        : null;
+    if (existing != null) return;
+    await this.storage.setAlarm(Date.now() + Math.max(0, delay));
+  }
+
+  private async scheduleAfterDurableAdmission(): Promise<void> {
     try {
-      const existing =
-        typeof this.storage.getAlarm === 'function'
-          ? await this.storage.getAlarm()
-          : null;
-      if (existing != null) return;
-      await this.storage.setAlarm(Date.now() + Math.max(0, delay));
-    } catch {
-      /* alarm best-effort */
+      await this.requestMaintenance();
+    } catch (error) {
+      throw new DurableAdmissionSchedulingError(error);
     }
   }
 
@@ -232,7 +238,7 @@ export class CloudflareReliabilityAdapter implements ReliabilityAdapter {
         Date.now()
       );
     });
-    await this.maybeAlarm();
+    await this.scheduleAfterDurableAdmission();
   }
 
   async acknowledgeJournal(ids: string[]): Promise<void> {
@@ -326,7 +332,7 @@ export class CloudflareReliabilityAdapter implements ReliabilityAdapter {
       );
       return newId;
     });
-    await this.maybeAlarm();
+    await this.scheduleAfterDurableAdmission();
     return id;
   }
 
@@ -442,7 +448,7 @@ export class CloudflareReliabilityAdapter implements ReliabilityAdapter {
       nextAttempts,
       id
     );
-    await this.maybeAlarm();
+    await this.scheduleAfterDurableAdmission();
   }
 
   async poisonDlq(id: string): Promise<void> {
@@ -481,7 +487,7 @@ export class CloudflareReliabilityAdapter implements ReliabilityAdapter {
         id
       );
     });
-    await this.maybeAlarm();
+    await this.scheduleAfterDurableAdmission();
     return id;
   }
 
@@ -569,14 +575,6 @@ export class CloudflareReliabilityAdapter implements ReliabilityAdapter {
 
   /** Restore a consumed alarm after maintenance failed. */
   async rearmMaintenance(): Promise<void> {
-    this.ensureReady();
-    if (!this.scheduleAlarms || typeof this.storage.setAlarm !== 'function') {
-      return;
-    }
-    const delay = await this.pendingMaintenanceDelayMs();
-    if (delay == null) return;
-    // Unlike admission's best-effort scheduler, a failure recovery must replace
-    // the consumed alarm and report setAlarm errors to the host.
-    await this.storage.setAlarm(Date.now() + Math.max(0, delay));
+    await this.requestMaintenance();
   }
 }

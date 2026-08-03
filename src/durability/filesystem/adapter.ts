@@ -93,6 +93,9 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
   private initPromise: Promise<void> | null = null;
   private queuedInitPromise: Promise<void> | null = null;
   private closePromise: Promise<void> | null = null;
+  private acceptingOperations = false;
+  private activeOperations = 0;
+  private operationDrainWaiters: Array<() => void> = [];
 
   constructor(options: FileReliabilityAdapterOptions) {
     if (!options?.namespace) {
@@ -201,6 +204,7 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
       this.wal = localWal;
       this.dlq = localDlq;
       this.ready = true;
+      this.acceptingOperations = this.closePromise === null;
     } catch (error) {
       const cleanupErrors: unknown[] = [];
       try {
@@ -225,9 +229,13 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
 
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
+    // Admission closes synchronously, before close performs its first await.
+    this.acceptingOperations = false;
     const closing = (async () => {
       const initializing = this.initPromise;
       if (initializing) await initializing.catch(() => undefined);
+      await this.waitForOperationsToDrain();
+      await this.testHooks?.beforeStorageClose?.();
 
       const wal = this.wal;
       const lock = this.lock;
@@ -236,8 +244,24 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
       this.dlq = null;
       this.lock = null;
 
-      await wal?.close();
-      await lock?.release();
+      const closeErrors: unknown[] = [];
+      try {
+        await wal?.close();
+      } catch (error) {
+        closeErrors.push(error);
+      }
+      try {
+        await lock?.release();
+      } catch (error) {
+        closeErrors.push(error);
+      }
+      if (closeErrors.length === 1) throw closeErrors[0];
+      if (closeErrors.length > 1) {
+        throw new AggregateError(
+          closeErrors,
+          'FileReliabilityAdapter storage close and lock release both failed',
+        );
+      }
     })();
     const tracked = closing.finally(() => {
       if (this.closePromise === tracked) this.closePromise = null;
@@ -246,115 +270,137 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
     return tracked;
   }
 
-  private ensure(): { wal: WALStorage; dlq: DLQStorage } {
+  private waitForOperationsToDrain(): Promise<void> {
+    if (this.activeOperations === 0) return Promise.resolve();
+    return new Promise((resolve) => { this.operationDrainWaiters.push(resolve); });
+  }
+
+  private runOperation<T>(
+    operation: (storage: { wal: WALStorage; dlq: DLQStorage }) => Promise<T>,
+  ): Promise<T> {
     if (!this.ready || !this.wal || !this.dlq) {
-      throw new Error('FileReliabilityAdapter not initialized — call init()');
+      return Promise.reject(
+        new Error('FileReliabilityAdapter not initialized — call init()'),
+      );
     }
-    return { wal: this.wal, dlq: this.dlq };
+    if (!this.acceptingOperations) {
+      return Promise.reject(
+        new Error('FileReliabilityAdapter is closing — no new operations are accepted'),
+      );
+    }
+    const storage = { wal: this.wal, dlq: this.dlq };
+    this.activeOperations++;
+    return (async () => {
+      try {
+        return await operation(storage);
+      } finally {
+        this.activeOperations--;
+        if (this.activeOperations === 0) {
+          const waiters = this.operationDrainWaiters;
+          this.operationDrainWaiters = [];
+          for (const resolve of waiters) resolve();
+        }
+      }
+    })();
   }
 
-  async appendJournal(log: LogbunLog): Promise<void> {
-    const { wal } = this.ensure();
-    await wal.append(log);
+  appendJournal(log: LogbunLog): Promise<void> {
+    return this.runOperation(({ wal }) => wal.append(log));
   }
 
-  async acknowledgeJournal(ids: string[]): Promise<void> {
-    const { wal } = this.ensure();
-    await wal.acknowledge(ids);
+  acknowledgeJournal(ids: string[]): Promise<void> {
+    return this.runOperation(({ wal }) => wal.acknowledge(ids));
   }
 
-  async recoverJournal(opts?: {
+  recoverJournal(opts?: {
     maxLogs?: number;
     maxBytes?: number;
   }): Promise<JournalRecoveryResult> {
-    const { wal } = this.ensure();
-    const result = await wal.readAllBounded({
-      maxLogs: opts?.maxLogs,
-      maxBytes: opts?.maxBytes,
+    return this.runOperation(async ({ wal }) => {
+      const result = await wal.readAllBounded({
+        maxLogs: opts?.maxLogs,
+        maxBytes: opts?.maxBytes,
+      });
+      return {
+        logs: result.logs,
+        truncated: result.truncated,
+        approxBytes: result.approxBytes,
+      };
     });
-    return {
-      logs: result.logs,
-      truncated: result.truncated,
-      approxBytes: result.approxBytes,
-    };
   }
 
-  async compactJournal(): Promise<void> {
-    const { wal } = this.ensure();
-    await wal.compact();
+  compactJournal(): Promise<void> {
+    return this.runOperation(({ wal }) => wal.compact());
   }
 
-  async writeDlq(tenantId: string | null, logs: LogbunLog[]): Promise<string> {
-    const { dlq } = this.ensure();
-    return dlq.write(tenantId, logs);
+  writeDlq(tenantId: string | null, logs: LogbunLog[]): Promise<string> {
+    return this.runOperation(({ dlq }) => dlq.write(tenantId, logs));
   }
 
-  async listDlq(opts?: {
+  listDlq(opts?: {
     includePending?: boolean;
     includeProcessing?: boolean;
     includeDead?: boolean;
   }): Promise<DLQEntry[]> {
-    const { dlq } = this.ensure();
-    return dlq.listAll(opts);
+    return this.runOperation(({ dlq }) => dlq.listAll(opts));
   }
 
-  async claimDlq(id?: string): Promise<ClaimedDlqBatch | null> {
-    const { dlq } = this.ensure();
-    const claimed = await dlq.claim(id);
-    if (!claimed) return null;
-    return {
-      id: claimed.id,
-      tenantId: claimed.batch.tenantId,
-      attempts: claimed.batch.attempts,
-      logs: claimed.batch.logs,
-    };
+  claimDlq(id?: string): Promise<ClaimedDlqBatch | null> {
+    return this.runOperation(async ({ dlq }) => {
+      const claimed = await dlq.claim(id);
+      if (!claimed) return null;
+      return {
+        id: claimed.id,
+        tenantId: claimed.batch.tenantId,
+        attempts: claimed.batch.attempts,
+        logs: claimed.batch.logs,
+      };
+    });
   }
 
-  async settleDlqSuccess(id: string): Promise<void> {
-    const { dlq } = this.ensure();
-    await dlq.markDone(id);
+  settleDlqSuccess(id: string): Promise<void> {
+    return this.runOperation(({ dlq }) => dlq.markDone(id));
   }
 
-  async settleDlqFailure(id: string, nextAttempts: number): Promise<void> {
-    const { dlq } = this.ensure();
-    await dlq.setAttempts(id, nextAttempts);
-    await dlq.markFailed(id);
+  settleDlqFailure(id: string, nextAttempts: number): Promise<void> {
+    return this.runOperation(async ({ dlq }) => {
+      await dlq.setAttempts(id, nextAttempts);
+      await dlq.markFailed(id);
+    });
   }
 
-  async poisonDlq(id: string): Promise<void> {
-    const { dlq } = this.ensure();
-    await dlq.markPoisoned(id);
+  poisonDlq(id: string): Promise<void> {
+    return this.runOperation(({ dlq }) => dlq.markPoisoned(id));
   }
 
-  async requeueDead(id: string): Promise<string> {
-    const { dlq } = this.ensure();
-    return dlq.requeueDead(id);
+  requeueDead(id: string): Promise<string> {
+    return this.runOperation(({ dlq }) => dlq.requeueDead(id));
   }
 
-  async deleteDead(id: string): Promise<void> {
-    const { dlq } = this.ensure();
-    await dlq.deleteDead(id);
+  deleteDead(id: string): Promise<void> {
+    return this.runOperation(({ dlq }) => dlq.deleteDead(id));
   }
 
-  async readDlq(id: string): Promise<ClaimedDlqBatch | null> {
-    const { dlq } = this.ensure();
-    const batch = await dlq.readById(id);
-    if (!batch) return null;
-    return {
-      id,
-      tenantId: batch.tenantId,
-      attempts: batch.attempts,
-      logs: batch.logs,
-    };
+  readDlq(id: string): Promise<ClaimedDlqBatch | null> {
+    return this.runOperation(async ({ dlq }) => {
+      const batch = await dlq.readById(id);
+      if (!batch) return null;
+      return {
+        id,
+        tenantId: batch.tenantId,
+        attempts: batch.attempts,
+        logs: batch.logs,
+      };
+    });
   }
 
-  async recoverOrphans(): Promise<void> {
-    const { dlq } = this.ensure();
-    await dlq.recoverOrphans();
+  recoverOrphans(): Promise<void> {
+    return this.runOperation(({ dlq }) => dlq.recoverOrphans());
   }
 
-  async getStats(): Promise<ReliabilityStats> {
-    const { wal, dlq } = this.ensure();
+  private async getStatsFrom(
+    { wal, dlq }: { wal: WALStorage; dlq: DLQStorage },
+  ): Promise<ReliabilityStats> {
     let journalApproxBytes = 0;
     try {
       journalApproxBytes = await wal.approximateSize();
@@ -372,8 +418,14 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
     };
   }
 
-  async pendingMaintenanceDelayMs(): Promise<number | null> {
-    const s = await this.getStats();
-    return s.hasPendingWork ? 0 : null;
+  getStats(): Promise<ReliabilityStats> {
+    return this.runOperation((storage) => this.getStatsFrom(storage));
+  }
+
+  pendingMaintenanceDelayMs(): Promise<number | null> {
+    return this.runOperation(async (storage) => {
+      const stats = await this.getStatsFrom(storage);
+      return stats.hasPendingWork ? 0 : null;
+    });
   }
 }

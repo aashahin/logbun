@@ -141,6 +141,53 @@ test.each(['namespace', 'dataDir', 'parent'] as const)(
   },
 );
 
+test.each(['namespace', 'dataDir', 'firstMissing', 'parent'] as const)(
+  'replacement WAL conservatively republishes every ancestor after discarded %s hierarchy debt',
+  async (level) => {
+    const rootParent = await mkdtemp(join(tmpdir(), `logbun-wal-replacement-${level}-`));
+    cleanupPaths.push(rootParent);
+    const firstMissing = join(rootParent, 'missing-a');
+    const dataDir = join(firstMissing, 'missing-b');
+    const namespace = `replacement-${level}`;
+    const namespaceDir = join(dataDir, namespace);
+    const targets = {
+      namespace: namespaceDir,
+      dataDir,
+      firstMissing,
+      parent: rootParent,
+    };
+    const failedTarget = targets[level];
+    const discarded = new WALStorage(namespace, dataDir, {
+      fsync: true,
+      directorySync: (directory, reason) => {
+        if (directory !== failedTarget || reason !== 'initialize-hierarchy') return;
+        const error = new Error(`discarded ${level} hierarchy debt`) as NodeJS.ErrnoException;
+        error.code = 'EIO';
+        throw error;
+      },
+    });
+
+    await expect(discarded.init()).rejects.toThrow(new RegExp(`discarded ${level}`));
+
+    const replacementSyncs: string[] = [];
+    const replacement = new WALStorage(namespace, dataDir, {
+      fsync: true,
+      directorySync: (directory, reason) => {
+        if (reason === 'initialize-hierarchy') replacementSyncs.push(directory);
+      },
+    });
+    await replacement.init();
+    expect(replacementSyncs.slice(0, 4)).toEqual([
+      namespaceDir,
+      dataDir,
+      firstMissing,
+      rootParent,
+    ]);
+    await expect(replacement.append(log(`accepted-after-${level}-replacement`))).resolves.toBeUndefined();
+    await replacement.close();
+  },
+);
+
 test('WAL treats a Deno capability denial at the dataDir parent as best-effort', async () => {
   const rootParent = await mkdtemp(join(tmpdir(), 'logbun-wal-hierarchy-deno-'));
   cleanupPaths.push(rootParent);

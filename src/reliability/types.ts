@@ -177,7 +177,15 @@ export interface ReliabilityAdapter {
   pendingMaintenanceDelayMs?(): Promise<number | null>;
 
   /**
+   * Optional: ensure a host wake-up exists whenever reliability work remains.
+   * Called after durable admission and after every host maintenance pass.
+   * Implementations must surface scheduler read/write failures.
+   */
+  requestMaintenance?(): Promise<void>;
+
+  /**
    * Optional: restore a host wake-up after a maintenance attempt failed.
+   * @deprecated Prefer {@link requestMaintenance}; retained for compatibility.
    * Implementations must not swallow scheduling failures; the caller can then
    * propagate so platforms such as Durable Objects retry the alarm handler.
    */

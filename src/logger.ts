@@ -558,17 +558,23 @@ export class AuditLogger<TActions extends string = string> {
       }
     }
 
-    if (failures.length > 0 && this.engine.reliability.rearmMaintenance) {
+    const requestMaintenance =
+      this.engine.reliability.requestMaintenance ??
+      this.engine.reliability.rearmMaintenance;
+    if (requestMaintenance) {
       try {
-        await this.engine.reliability.rearmMaintenance();
+        await requestMaintenance.call(this.engine.reliability);
       } catch (rearmError) {
+        if (failures.length === 0) throw rearmError;
         throw new AggregateError(
           [...failures, rearmError],
           'maintenance failed and its host wake-up could not be restored',
         );
       }
       if (failures.length === 1) throw failures[0];
-      throw new AggregateError(failures, 'multiple maintenance phases failed');
+      if (failures.length > 1) {
+        throw new AggregateError(failures, 'multiple maintenance phases failed');
+      }
     }
     // Retention failures historically propagated on adapters without a host
     // rearm seam; retain that contract. Flush/scan remain observable events.
