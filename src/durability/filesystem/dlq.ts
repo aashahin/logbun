@@ -18,6 +18,7 @@ import { randomUUIDv7 } from '../../utils/uuidv7';
 import { constants as FsConstants } from 'node:fs';
 import {
   mkdir,
+  link,
   open,
   lstat,
   readdir,
@@ -53,6 +54,18 @@ export interface DLQStorageOptions {
   encryptionKey?: EncryptionKeyBytes;
   /** @internal Test crash-window hook, invoked after temp fsync and before rename. */
   beforeAtomicRename?: (targetPath: string) => void | Promise<void>;
+  /** @internal Invoked immediately before the no-overwrite dead→pending link. */
+  beforeRequeueLink?: (
+    deadPath: string,
+    pendingPath: string,
+  ) => void | Promise<void>;
+  /** @internal Invoked after linked state is durable but before dead unlink. */
+  afterRequeueLink?: (
+    deadPath: string,
+    pendingPath: string,
+  ) => void | Promise<void>;
+  /** @internal Deterministic hard-link seam for unsupported-platform tests. */
+  requeueLink?: (deadPath: string, pendingPath: string) => Promise<void>;
 }
 
 export const DLQ_MAX_FILES_DEFAULT = 10_000;
@@ -167,6 +180,9 @@ export class DLQStorage {
   private readonly maxFiles: number;
   private readonly encryptionKey?: EncryptionKeyBytes;
   private readonly beforeAtomicRename?: (targetPath: string) => void | Promise<void>;
+  private readonly beforeRequeueLink?: DLQStorageOptions['beforeRequeueLink'];
+  private readonly afterRequeueLink?: DLQStorageOptions['afterRequeueLink'];
+  private readonly requeueLink: NonNullable<DLQStorageOptions['requeueLink']>;
   private writeChain: Promise<void> = Promise.resolve();
 
   constructor(
@@ -183,6 +199,9 @@ export class DLQStorage {
       options?.maxFiles ?? options?.maxDlqFiles ?? DLQ_MAX_FILES_DEFAULT;
     this.encryptionKey = options?.encryptionKey;
     this.beforeAtomicRename = options?.beforeAtomicRename;
+    this.beforeRequeueLink = options?.beforeRequeueLink;
+    this.afterRequeueLink = options?.afterRequeueLink;
+    this.requeueLink = options?.requeueLink ?? ((deadPath, pendingPath) => link(deadPath, pendingPath));
   }
 
   private runWriteExclusive<T>(fn: () => Promise<T>): Promise<T> {
@@ -207,6 +226,7 @@ export class DLQStorage {
     await this.assertStorageSegments(true);
     await mkdir(this.dir, { recursive: true });
     await this.assertSecureDirectory();
+    await this.healRequeueLinkDuplicates();
   }
 
   async countByKind(): Promise<{
@@ -286,6 +306,7 @@ export class DLQStorage {
   /** Reject any configured storage segment that has become a symbolic link. */
   private async assertExistingDataDirAncestor(): Promise<void> {
     let candidate = this.dataDir;
+    let crossedMissingSegment = false;
     for (;;) {
       try {
         const info = await lstat(candidate);
@@ -300,15 +321,18 @@ export class DLQStorage {
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
         if (code === 'ENOENT') {
+          crossedMissingSegment = true;
           const parent = dirname(candidate);
           if (parent === candidate) return;
           candidate = parent;
           continue;
         }
-        // Deno may grant the configured (currently missing) data directory
-        // without granting metadata reads on its parent. mkdir is then still
-        // permission-confined and the post-create physical check below runs.
-        if (code === 'ERR_DENO_NOT_CAPABLE' || (error as Error).name === 'NotCapable') {
+        // Accept a Deno permission boundary only after observing a missing
+        // configured segment. Direct capability failures remain fatal.
+        if (
+          crossedMissingSegment &&
+          (code === 'ERR_DENO_NOT_CAPABLE' || (error as Error).name === 'NotCapable')
+        ) {
           return;
         }
         throw error;
@@ -437,6 +461,55 @@ export class DLQStorage {
     await this.assertSecureExistingFile(path);
     await unlink(path);
     if (this.fsync) await this.fsyncDirectory();
+  }
+
+  private async linkRequeueState(deadPath: string, pendingPath: string): Promise<void> {
+    await this.assertSecureExistingFile(deadPath);
+    this.assertUnderDir(pendingPath);
+    await this.assertSecureDirectory();
+    try {
+      await this.requeueLink(deadPath, pendingPath);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST') {
+        throw new Error('dlq_state_collision: destination state already exists');
+      }
+      if (['EXDEV', 'ENOSYS', 'ENOTSUP', 'EOPNOTSUPP', 'EPERM'].includes(code ?? '')) {
+        throw new Error(
+          `dlq_requeue_link_unsupported: atomic requeue requires same-filesystem hard links (${code ?? 'unknown'})`,
+        );
+      }
+      throw error;
+    }
+    if (this.fsync) await this.fsyncDirectory();
+  }
+
+  private async healRequeueLinkDuplicates(): Promise<void> {
+    await this.assertSecureDirectory();
+    const entries = await readdir(this.dir);
+    for (const deadName of entries.filter((name) => name.endsWith('.batch.dead'))) {
+      const id = idFromFilename(deadName);
+      if (!id) continue;
+      const deadPath = this.pathFor(id, 'dead');
+      const pendingPath = this.pathFor(id, 'pending');
+      let pendingInfo;
+      try {
+        pendingInfo = await lstat(pendingPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
+      }
+      await this.assertSecureExistingFile(deadPath);
+      await this.assertSecureExistingFile(pendingPath);
+      const deadInfo = await lstat(deadPath);
+      if (deadInfo.dev !== pendingInfo.dev || deadInfo.ino !== pendingInfo.ino) {
+        throw new Error(
+          `dlq_state_collision: pending and dead states for ${id} are different files`,
+        );
+      }
+      await unlink(deadPath);
+      if (this.fsync) await this.fsyncDirectory();
+    }
   }
 
   private async writeFileBody(path: string, body: string): Promise<void> {
@@ -668,17 +741,17 @@ export class DLQStorage {
         attempts: 0,
         logs: batch.logs,
       };
-      // Reset metadata atomically while the entry is still dead. A crash here
-      // leaves one valid dead entry that can be retried. The following rename
-      // is the sole state transition and never creates pending+dead copies.
+      // Reset metadata atomically while the entry is still dead. Requeue then
+      // links dead→pending without overwrite, syncs that directory entry,
+      // unlinks dead, and syncs again. A crash in between leaves a same-inode
+      // pair that init/recovery heals without creating duplicate delivery.
       if (batch.v !== 2 || batch.id !== stableId || batch.attempts !== 0) {
         await this.writeFileBody(deadPath, JSON.stringify(envelope));
       }
-      await this.beforeAtomicRename?.(newPath);
-      // The hook models the last pre-rename fault/race boundary. Revalidate
-      // afterwards so a newly appeared pending state is never overwritten.
-      await this.assertDestinationAbsent(newPath);
-      await this.renameSecurely(deadPath, newPath);
+      await this.beforeRequeueLink?.(deadPath, newPath);
+      await this.linkRequeueState(deadPath, newPath);
+      await this.afterRequeueLink?.(deadPath, newPath);
+      await this.unlinkSecurely(deadPath);
       return stableId;
     });
   }
@@ -857,6 +930,7 @@ export class DLQStorage {
 
   async recoverOrphans(): Promise<void> {
     await this.assertSecureDirectory();
+    await this.healRequeueLinkDuplicates();
     let entries: string[];
     try {
       entries = await readdir(this.dir);

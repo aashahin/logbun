@@ -61,7 +61,25 @@ export interface WALStorageOptions {
   segmentBytes?: number;
   /** Optional AES-256-GCM key (32 raw bytes after normalize). */
   encryptionKey?: EncryptionKeyBytes;
+  /** @internal Deterministic seam for directory-fsync fault/order tests. */
+  directorySync?: (
+    directory: string,
+    reason: WALDirectorySyncReason,
+  ) => void | Promise<void>;
 }
+
+export type WALDirectorySyncReason =
+  | 'initialize'
+  | 'rotate'
+  | 'rewrite'
+  | 'delete-segment';
+
+export const WAL_DIRECTORY_FSYNC_UNSUPPORTED_CODES = [
+  'EINVAL',
+  'ENOTSUP',
+  'EOPNOTSUPP',
+  'EPERM',
+] as const;
 
 /** Options for {@link WALStorage.readAllBounded}. */
 export interface WALReadBoundedOptions {
@@ -97,6 +115,8 @@ export class WALStorage {
   private readonly hardMaxBytes: boolean;
   private readonly segmentBytes: number;
   private readonly encryptionKey?: EncryptionKeyBytes;
+  private readonly directorySync?: WALStorageOptions['directorySync'];
+  private pendingDirectorySync: WALDirectorySyncReason | null = null;
   private ready = false;
   private pendingAckCount = 0;
   private opChain: Promise<void> = Promise.resolve();
@@ -125,6 +145,7 @@ export class WALStorage {
       options?.segmentBytes ?? WAL_SEGMENT_BYTES_DEFAULT
     );
     this.encryptionKey = options?.encryptionKey;
+    this.directorySync = options?.directorySync;
   }
 
   get softMaxBytes(): number {
@@ -151,6 +172,44 @@ export class WALStorage {
       );
     }
     return FsConstants.O_NOFOLLOW;
+  }
+
+  private async syncDirectory(reason: WALDirectorySyncReason): Promise<void> {
+    if (!this.fsync) return;
+    try {
+      if (this.directorySync) {
+        await this.directorySync(this.dir, reason);
+      } else {
+        const fh = await open(this.dir, FsConstants.O_RDONLY);
+        try {
+          await fh.sync();
+        } finally {
+          await fh.close();
+        }
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (
+        WAL_DIRECTORY_FSYNC_UNSUPPORTED_CODES.includes(
+          code as (typeof WAL_DIRECTORY_FSYNC_UNSUPPORTED_CODES)[number],
+        )
+      ) {
+        this.pendingDirectorySync = null;
+        return;
+      }
+      throw error;
+    }
+    this.pendingDirectorySync = null;
+  }
+
+  private markDirectoryMutation(reason: WALDirectorySyncReason): void {
+    if (this.fsync) this.pendingDirectorySync = reason;
+  }
+
+  private async retryPendingDirectorySync(): Promise<void> {
+    if (this.pendingDirectorySync) {
+      await this.syncDirectory(this.pendingDirectorySync);
+    }
   }
 
   private async assertSecureDirectory(): Promise<void> {
@@ -209,10 +268,12 @@ export class WALStorage {
     await fh.close();
   }
 
-  private async ensureSecureFile(filePath: string): Promise<void> {
-    if (await this.secureFileExists(filePath)) return;
+  private async ensureSecureFile(filePath: string): Promise<boolean> {
+    if (await this.secureFileExists(filePath)) return false;
+    let created = false;
     try {
       await this.createSecureFile(filePath);
+      created = true;
     } catch (error) {
       // `instanceLock: false` deliberately permits concurrent initializers.
       // An exclusive-create loser may accept the winner only after validating
@@ -220,6 +281,7 @@ export class WALStorage {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
     await this.assertSecureFile(filePath);
+    return created;
   }
 
   private async openSecureFile(filePath: string, flags: number) {
@@ -254,9 +316,13 @@ export class WALStorage {
     await assertNoSymlinkPath(this.dir, 'WAL directory path');
     await mkdir(this.dir, { recursive: true });
     await this.assertSecureDirectory();
+    this.markDirectoryMutation('initialize');
     await this.ensureSecureFile(this.path);
     const ackExisted = await this.secureFileExists(this.ackPath);
     await this.ensureSecureFile(this.ackPath);
+    // Sync on every init so a retry or fresh instance settles directory-entry
+    // mutations left behind by an earlier unexpected directory-sync failure.
+    await this.syncDirectory('initialize');
     if (ackExisted) {
       const ackText = await this.readTextFileSecure(this.ackPath);
       this.pendingAckCount = ackText
@@ -289,6 +355,7 @@ export class WALStorage {
       if (!this.ready) {
         throw new Error('WAL not initialized — call init() first');
       }
+      await this.retryPendingDirectorySync();
 
       const encodedLine = await this.encodeLogLine(log);
       // Include the separator written by appendFile.  Check after serializing
@@ -342,6 +409,7 @@ export class WALStorage {
     if (ids.length === 0) return;
 
     return this.runExclusive(async () => {
+      await this.retryPendingDirectorySync();
       const unique = [...new Set(ids)];
       const body = unique.map((id) => id + '\n').join('');
       await this.appendTextSecure(this.ackPath, body);
@@ -358,12 +426,16 @@ export class WALStorage {
    * Never deletes unacked entries.
    */
   async compact(): Promise<void> {
-    return this.runExclusive(() => this.compactUnlocked());
+    return this.runExclusive(async () => {
+      await this.retryPendingDirectorySync();
+      await this.compactUnlocked();
+    });
   }
 
   /** @deprecated Prefer {@link compact}. */
   async truncate(): Promise<void> {
     return this.runExclusive(async () => {
+      await this.retryPendingDirectorySync();
       const pending = await this.readPendingUnlocked();
       if (pending.length === 0) {
         await this.clearAllSegmentsUnlocked();
@@ -396,8 +468,10 @@ export class WALStorage {
     if (await this.secureFileExists(segPath)) {
       throw new Error(`WAL segment collision: ${segName}`);
     }
+    this.markDirectoryMutation('rotate');
     await rename(this.path, segPath);
     await this.createSecureFile(this.path);
+    await this.syncDirectory('rotate');
   }
 
   private async listSegmentPathsUnlocked(): Promise<string[]> {
@@ -439,7 +513,9 @@ export class WALStorage {
       } else if (kept.length === 0) {
         try {
           await this.assertSecureFile(p);
+          this.markDirectoryMutation('delete-segment');
           await unlink(p);
+          await this.syncDirectory('delete-segment');
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
         }
@@ -463,7 +539,9 @@ export class WALStorage {
     for (const p of segs) {
       try {
         await this.assertSecureFile(p);
+        this.markDirectoryMutation('delete-segment');
         await unlink(p);
+        await this.syncDirectory('delete-segment');
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       }
@@ -657,7 +735,9 @@ export class WALStorage {
       }
       if (!tempPath) throw new Error('WAL could not create a unique temporary file');
       await this.assertSecureFile(path);
+      this.markDirectoryMutation('rewrite');
       await rename(tempPath, path);
+      await this.syncDirectory('rewrite');
       tempPath = null;
     } finally {
       if (tempPath) await unlink(tempPath).catch(() => undefined);

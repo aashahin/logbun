@@ -60,7 +60,7 @@ not on `LogbunConfig`.
 
 | Adapter option | Default | Meaning |
 |---|---:|---|
-| `dataDir` | `.logbun` | Parent directory; namespace stays path-confined under it |
+| `dataDir` | `.logbun` | Parent directory; namespace paths are validated beneath it (see the production threat model) |
 | `wal.fsync` | true | fsync journal appends / compaction |
 | `wal.segmentBytes` | 16 MiB | WAL rotation threshold |
 | `wal.hardMaxBytes` | true | Refuse over-limit append with `wal_full` |
@@ -71,9 +71,10 @@ not on `LogbunConfig`.
 | `instanceLock` | true | Exclusive namespace ownership |
 
 Deno consumes the npm package and needs filesystem permissions, for example
-`deno run --allow-read --allow-write=./.logbun app.ts`. Deno's Node
-compatibility layer may additionally require its documented minimal
-`--allow-sys` permissions on platforms that inspect user/group metadata.
+`deno run --allow-read=./.logbun --allow-write=./.logbun --allow-sys=uid,gid app.ts`.
+The configured directory may be absent on first run. When Deno denies metadata
+access above that missing path, Logbun treats the denial as the runtime
+capability boundary and validates the created in-scope paths afterwards.
 
 ### Cloudflare Workers: `CloudflareReliabilityAdapter`
 

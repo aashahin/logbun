@@ -22,10 +22,6 @@ try {
   const packed = JSON.parse(run('npm', ['pack', '--json', '--pack-destination', packs]));
   const tarball = join(packs, packed[0].filename);
   await mkdir(consumer);
-  // A path-scoped Deno read grant cannot inspect the parent of a missing leaf.
-  // Pre-create the configured root so fail-closed symlink validation remains
-  // possible without broadening the smoke test's filesystem permissions.
-  await mkdir(dataDir);
   run('npm', ['install', '--ignore-scripts', '--no-package-lock', '--prefix', consumer, tarball]);
   await copyFile(join(root, 'scripts', 'deno-smoke.ts'), join(consumer, 'deno-smoke.ts'));
 

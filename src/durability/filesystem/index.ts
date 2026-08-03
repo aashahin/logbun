@@ -4,7 +4,7 @@
  * Persistent reliability for Node.js, Bun, and Deno (node:fs).
  *
  * Deno permissions:
- *   deno run --allow-read --allow-write=./.logbun your_app.ts
+ *   deno run --allow-read=./.logbun --allow-write=./.logbun --allow-sys=uid,gid your_app.ts
  * Grant read/write on whatever `dataDir` you configure (default `.logbun`).
  */
 export {
@@ -20,7 +20,11 @@ export {
   sanitizeNamespace,
 } from './path';
 
-export { InstanceLock, InstanceLockError } from './instance-lock';
+export {
+  InstanceLock,
+  InstanceLockError,
+  type InstanceLockOptions,
+} from './instance-lock';
 
 export {
   WALStorage,

@@ -10,9 +10,13 @@
  *   remain required.
  * - **Not safe on NFS** (or other network filesystems with weak exclusive-create /
  *   cache coherence): use a single local disk, or disable and coordinate externally.
+ * - **Not a same-user security boundary**: this coordinates cooperative owners;
+ *   a malicious process with directory write access can replace/remove the lock.
  * - Holds the lock file handle open for the process lifetime after acquire.
  *
- * Deno: requires `--allow-read` / `--allow-write` on the data directory.
+ * Deno: requires path-scoped `--allow-read` / `--allow-write` on the data
+ * directory; `--allow-run` is not required because unknown PID-probe failures
+ * are treated as potentially alive.
  */
 
 import { open as fsOpen, unlink, readFile, mkdir } from 'node:fs/promises';
@@ -27,25 +31,32 @@ export class InstanceLockError extends Error {
   }
 }
 
-function pidAlive(pid: number): boolean {
+export interface InstanceLockOptions {
+  /** @internal Deterministic process-liveness seam for tests. */
+  killProcess?: (pid: number, signal: 0) => unknown;
+}
+
+function pidAlive(
+  pid: number,
+  killProcess: NonNullable<InstanceLockOptions['killProcess']>,
+): boolean {
   if (!Number.isFinite(pid) || pid <= 0) return false;
   try {
-    process.kill(pid, 0);
+    killProcess(pid, 0);
     return true;
   } catch (err) {
     const code =
       err && typeof err === 'object' && 'code' in err
         ? (err as { code?: string }).code
         : undefined;
-    if (code === 'EPERM') return true;
-    return false;
+    return code !== 'ESRCH';
   }
 }
 
-function parseLockPid(raw: string): number {
+function parseLockPid(raw: string): number | null {
   const line = raw.trim().split(/\r?\n/)[0] ?? '';
   const pid = parseInt(line, 10);
-  return Number.isFinite(pid) ? pid : 0;
+  return Number.isFinite(pid) && pid > 0 ? pid : null;
 }
 
 function processStartTimeMs(): number {
@@ -54,11 +65,17 @@ function processStartTimeMs(): number {
 
 export class InstanceLock {
   private readonly path: string;
+  private readonly killProcess: NonNullable<InstanceLockOptions['killProcess']>;
   private handle: FileHandle | null = null;
 
-  constructor(namespace: string, dataDir?: string) {
+  constructor(
+    namespace: string,
+    dataDir?: string,
+    options?: InstanceLockOptions,
+  ) {
     const root = resolveLogbunDir(namespace, dataDir);
     this.path = join(root, '.instance.lock');
+    this.killProcess = options?.killProcess ?? ((pid, signal) => process.kill(pid, signal));
   }
 
   get lockPath(): string {
@@ -90,15 +107,24 @@ export class InstanceLock {
             : new Error(`instance lock acquire failed: ${String(err)}`);
         }
 
-        let holderPid = 0;
+        let holderPid: number | null;
         try {
           const raw = await readFile(this.path, 'utf8');
           holderPid = parseLockPid(raw);
-        } catch {
-          holderPid = 0;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+          throw new InstanceLockError(
+            `instance_lock_held: cannot verify the owner of ${this.path}; refusing to steal it`,
+          );
         }
 
-        if (holderPid > 0 && pidAlive(holderPid)) {
+        if (holderPid === null) {
+          throw new InstanceLockError(
+            `instance_lock_held: invalid owner metadata in ${this.path}; refusing to steal it`,
+          );
+        }
+
+        if (pidAlive(holderPid, this.killProcess)) {
           throw new InstanceLockError(
             `instance_lock_held: another process (pid ${holderPid}) holds ${this.path}. ` +
               `Use a unique namespace per replica, or ensure the previous process shut down cleanly.`
@@ -119,13 +145,13 @@ export class InstanceLock {
   }
 
   async release(): Promise<void> {
-    if (this.handle) {
-      try {
-        await this.handle.close();
-      } catch {
-        /* ignore */
-      }
-      this.handle = null;
+    if (!this.handle) return;
+    const ownedHandle = this.handle;
+    this.handle = null;
+    try {
+      await ownedHandle.close();
+    } catch {
+      /* continue with ownership-checked cleanup */
     }
     try {
       const raw = await readFile(this.path, 'utf8');

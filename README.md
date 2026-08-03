@@ -150,7 +150,11 @@ const instanceId = Deno.env.get('INSTANCE_ID') ?? 'my-app-instance-1';
 ```
 
 **Deno filesystem permissions:**
-`deno run --allow-env=INSTANCE_ID --allow-read --allow-write=./.logbun app.ts`
+`deno run --allow-env=INSTANCE_ID --allow-read=./.logbun --allow-write=./.logbun --allow-sys=uid,gid app.ts`
+
+The path-scoped grant supports first-run creation when `.logbun` does not yet
+exist. See the [filesystem threat model](./docs/production.md#filesystem-security-model)
+for the capability-boundary and same-user concurrency limitations.
 
 For Bun's built-in SQLite destination specifically, import
 `BunSQLiteAdapter` from `logbun/adapters/bun-sqlite` in a Bun-only module.

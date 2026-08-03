@@ -119,7 +119,7 @@ Root still exports pure helpers: `sanitizeNamespace`, `sanitizeTenantKey`, crypt
 ### 7. Deno permissions (filesystem)
 
 ```bash
-deno run --allow-read --allow-write=./.logbun your_app.ts
+deno run --allow-read=./.logbun --allow-write=./.logbun --allow-sys=uid,gid your_app.ts
 ```
 
 Grant read/write on your configured `dataDir` (default `.logbun`).
