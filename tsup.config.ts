@@ -18,7 +18,10 @@ export default defineConfig({
     'plugins/hono': 'src/plugins/hono.ts',
   },
   format: ['esm', 'cjs'],
-  dts: true,
+  // TypeScript 7 no longer exposes the compiler API used by tsup's bundled
+  // declaration rollup plugin. Declarations are emitted by tsc in the build
+  // pipeline after the JavaScript bundles are complete.
+  dts: false,
   splitting: true,
   clean: true,
   treeshake: true,

@@ -37,8 +37,19 @@ try {
   const packageJson = JSON.parse(await readFile(join(consumer, 'node_modules', 'logbun', 'package.json'), 'utf8'));
   if (packageJson.version !== '1.0.0') throw new Error('packed package version mismatch');
   for (const declarationName of ['index.d.ts', 'index.d.cts']) {
+    // TypeScript 7 no longer exposes the compiler API required by tsup's
+    // declaration rollup. The package therefore ships modular declarations;
+    // validate the public adapter declaration reached by the entrypoint.
     const declaration = await readFile(
-      join(consumer, 'node_modules', 'logbun', 'dist', 'durability', 'filesystem', declarationName),
+      join(
+        consumer,
+        'node_modules',
+        'logbun',
+        'dist',
+        'durability',
+        'filesystem',
+        declarationName.replace('index', 'adapter'),
+      ),
       'utf8',
     );
     if (

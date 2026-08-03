@@ -6,7 +6,7 @@ export default defineConfig({
     'durability/cloudflare/index': 'src/durability/cloudflare/index.ts',
   },
   format: ['esm'],
-  dts: true,
+  dts: false,
   splitting: false,
   clean: false,
   treeshake: true,

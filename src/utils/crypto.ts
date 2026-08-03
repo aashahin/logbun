@@ -25,7 +25,7 @@ export async function normalizeEncryptionKey(
       throw new Error('encryptionKey must not be empty');
     }
     // Hash arbitrary bytes to 32
-    const digest = await crypto.subtle.digest('SHA-256', key);
+    const digest = await crypto.subtle.digest('SHA-256', new Uint8Array(key));
     return new Uint8Array(digest);
   }
 
@@ -73,7 +73,7 @@ async function importAesKey(raw: EncryptionKeyBytes): Promise<CryptoKey> {
   if (cached) return cached;
   const key = await crypto.subtle.importKey(
     'raw',
-    raw,
+    new Uint8Array(raw),
     { name: 'AES-GCM' },
     false,
     ['encrypt', 'decrypt']
@@ -127,7 +127,11 @@ export async function decryptUtf8(
   const iv = b64decode(rest.slice(0, colon));
   const ct = b64decode(rest.slice(colon + 1));
   const key = await importAesKey(rawKey);
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+  const pt = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: new Uint8Array(iv) },
+    key,
+    new Uint8Array(ct)
+  );
   return new TextDecoder().decode(pt);
 }
 
