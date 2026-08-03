@@ -115,7 +115,35 @@ try {
     atomic.deleted !== null
   ) throw new Error('atomic Cloudflare DLQ lifecycle failed');
 
-  console.log('Cloudflare smoke OK (recreated workerd DO SQLite persistence, recovery, DLQ, alarm)');
+  // A consumed alarm must be restored when maintenance fails, and the handler
+  // must reject so the platform can also apply its retry policy.
+  const deliveredBeforeFailure = (await request('/state')).delivered;
+  await request('/fail?value=true');
+  await request('/admit?action=alarm-rearm');
+  await request('/clear-alarm');
+  await request('/fail-maintenance-once');
+  let maintenanceFailed = false;
+  try {
+    const response = await mf.dispatchFetch('http://worker/maintenance');
+    maintenanceFailed = !response.ok;
+  } catch {
+    maintenanceFailed = true;
+  }
+  if (!maintenanceFailed) {
+    throw new Error('failed DO maintenance did not propagate to the alarm host');
+  }
+  const rearmed = await request('/state');
+  if (rearmed.alarm == null || rearmed.dlqPending < 1) {
+    throw new Error('failed DO maintenance consumed its only pending-work alarm');
+  }
+  await request('/fail?value=false');
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  const recoveredFailure = await request('/state');
+  if (recoveredFailure.delivered <= deliveredBeforeFailure || recoveredFailure.dlqPending !== 0) {
+    throw new Error('rearmed DO alarm did not retry and settle maintenance work');
+  }
+
+  console.log('Cloudflare smoke OK (recreated workerd DO persistence, DLQ, alarm rearm/retry)');
 } finally {
   await mf?.dispose();
   await rm(temp, { recursive: true, force: true });

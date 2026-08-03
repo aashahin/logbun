@@ -43,6 +43,53 @@ test('InstanceLock exclusive: second acquire fails while first holds', async () 
   await b.release();
 });
 
+test('main lock metadata is complete before canonical publication and exactly one contender wins', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-main-publish-'));
+  cleanupPaths.push(dataDir);
+  const namespaceDir = join(dataDir, 'main-publish');
+  const lockPath = join(namespaceDir, '.instance.lock');
+  let signalMetadataStaged!: () => void;
+  const metadataStaged = new Promise<void>((resolve) => {
+    signalMetadataStaged = resolve;
+  });
+  let finishMetadata!: () => void;
+  const metadataMayFinish = new Promise<void>((resolve) => {
+    finishMetadata = resolve;
+  });
+  const first = new InstanceLock('main-publish', dataDir, {
+    writeMetadata: async (handle, metadata) => {
+      signalMetadataStaged();
+      await metadataMayFinish;
+      await handle.writeFile(metadata, 'utf8');
+      await handle.sync();
+    },
+  });
+  const second = new InstanceLock('main-publish', dataDir);
+
+  const firstAcquire = first.acquire();
+  await metadataStaged;
+  const canonicalWasAbsent = await readFile(lockPath, 'utf8').then(
+    () => false,
+    (error: NodeJS.ErrnoException) => error.code === 'ENOENT',
+  );
+  const secondResult = await second.acquire().then(
+    () => 'acquired' as const,
+    () => 'rejected' as const,
+  );
+  finishMetadata();
+  const firstResult = await firstAcquire.then(
+    () => 'acquired' as const,
+    () => 'rejected' as const,
+  );
+
+  expect(canonicalWasAbsent).toBe(true);
+  expect([firstResult, secondResult].sort()).toEqual(['acquired', 'rejected']);
+  expect(await readFile(lockPath, 'utf8')).toStartWith(`${process.pid}\n`);
+  await first.release();
+  await second.release();
+  expect(await readdir(namespaceDir)).toEqual([]);
+});
+
 test('metadata write failure closes and removes only the lock file it created', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-write-failure-'));
   cleanupPaths.push(dataDir);
@@ -86,6 +133,93 @@ test('metadata sync failure after writing still closes, cleans up, and permits r
   await retry.release();
 });
 
+test('failure after staged main sync but before publication leaves no malformed canonical lock', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-before-publish-'));
+  cleanupPaths.push(dataDir);
+  const namespaceDir = join(dataDir, 'before-publish');
+  const failed = new InstanceLock('before-publish', dataDir, {
+    beforeMainPublish: () => {
+      const error = new Error('simulated failure before main publication') as NodeJS.ErrnoException;
+      error.code = 'EIO';
+      throw error;
+    },
+  });
+
+  await expect(failed.acquire()).rejects.toThrow(/before main publication/);
+  expect(await readdir(namespaceDir)).toEqual([]);
+  const retry = new InstanceLock('before-publish', dataDir);
+  await expect(retry.acquire()).resolves.toBeUndefined();
+  await retry.release();
+});
+
+test('main lock fails explicitly when atomic hard-link publication is unsupported', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-link-unsupported-'));
+  cleanupPaths.push(dataDir);
+  const namespaceDir = join(dataDir, 'link-unsupported');
+  const lock = new InstanceLock('link-unsupported', dataDir, {
+    mainLink: async () => {
+      const error = new Error('hard links unavailable') as NodeJS.ErrnoException;
+      error.code = 'ENOTSUP';
+      throw error;
+    },
+  });
+
+  await expect(lock.acquire()).rejects.toThrow(
+    /instance_lock_atomic_publication_unsupported.*ENOTSUP/,
+  );
+  expect(await readdir(namespaceDir)).toEqual([]);
+});
+
+test('a canonical main lock observed immediately after publication always has valid owner metadata', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-after-publish-'));
+  cleanupPaths.push(dataDir);
+  const namespaceDir = join(dataDir, 'after-publish');
+  const lockPath = join(namespaceDir, '.instance.lock');
+  let signalPublished!: () => void;
+  const published = new Promise<void>((resolve) => {
+    signalPublished = resolve;
+  });
+  let finishPublication!: () => void;
+  const publicationMayFinish = new Promise<void>((resolve) => {
+    finishPublication = resolve;
+  });
+  const owner = new InstanceLock('after-publish', dataDir, {
+    afterMainPublish: async () => {
+      signalPublished();
+      await publicationMayFinish;
+    },
+  });
+  const contender = new InstanceLock('after-publish', dataDir);
+
+  const acquiring = owner.acquire();
+  await published;
+  expect(await readFile(lockPath, 'utf8')).toStartWith(`${process.pid}\n`);
+  await expect(contender.acquire()).rejects.toBeInstanceOf(InstanceLockError);
+  finishPublication();
+  await expect(acquiring).resolves.toBeUndefined();
+  await owner.release();
+  expect(await readdir(namespaceDir)).toEqual([]);
+});
+
+test('failure after canonical publication ownership-cleans the complete lock and permits retry', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-after-publish-failure-'));
+  cleanupPaths.push(dataDir);
+  const namespaceDir = join(dataDir, 'after-publish-failure');
+  const failed = new InstanceLock('after-publish-failure', dataDir, {
+    afterMainPublish: () => {
+      const error = new Error('simulated failure after canonical publication') as NodeJS.ErrnoException;
+      error.code = 'EIO';
+      throw error;
+    },
+  });
+
+  await expect(failed.acquire()).rejects.toThrow(/after canonical publication/);
+  expect(await readdir(namespaceDir)).toEqual([]);
+  const retry = new InstanceLock('after-publish-failure', dataDir);
+  await expect(retry.acquire()).resolves.toBeUndefined();
+  await retry.release();
+});
+
 test('metadata write failure never unlinks a replacement lock', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-write-replaced-'));
   cleanupPaths.push(dataDir);
@@ -97,6 +231,8 @@ test('metadata write failure never unlinks a replacement lock', async () => {
       createdHandle = handle;
       await handle.writeFile(metadata, 'utf8');
       await handle.sync();
+    },
+    afterMainPublish: async () => {
       await unlink(lockPath);
       await writeFile(lockPath, '2147483646\n0\n');
       const error = new Error('simulated failure after replacement') as NodeJS.ErrnoException;
@@ -357,17 +493,16 @@ test('recovery claim metadata failure closes and ownership-cleans its staged ino
   await retry.release();
 });
 
-test('a claimant replaced before the main mutation aborts without unlinking the winner', async () => {
+test('a live claimant cannot be preempted after its final main identity check', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-claim-replaced-before-'));
   cleanupPaths.push(dataDir);
   const namespaceDir = join(dataDir, 'claim-replaced-before');
   const lockPath = join(namespaceDir, '.instance.lock');
   await mkdir(namespaceDir);
   await writeFile(lockPath, '2147483646\n0\n');
-  let now = 1_000;
-  let signalBeforeMutation!: () => void;
-  const beforeMutation = new Promise<void>((resolve) => {
-    signalBeforeMutation = resolve;
+  let signalFinalCheck!: () => void;
+  const finalCheckReached = new Promise<void>((resolve) => {
+    signalFinalCheck = resolve;
   });
   let resumeFirst!: () => void;
   const firstMayResume = new Promise<void>((resolve) => {
@@ -378,42 +513,38 @@ test('a claimant replaced before the main mutation aborts without unlinking the 
     error.code = 'ESRCH';
     throw error;
   };
+  let paused = false;
   const first = new InstanceLock('claim-replaced-before', dataDir, {
     killProcess: staleProbe,
-    now: () => now,
-    recoveryClaimLeaseMs: 100,
-    beforeOwnedUnlink: async () => {
-      signalBeforeMutation();
+    afterOwnedUnlinkCheck: async () => {
+      if (paused) return;
+      paused = true;
+      signalFinalCheck();
       await firstMayResume;
     },
   });
   const firstAcquire = first.acquire();
-  await beforeMutation;
-  now = 1_101;
+  await finalCheckReached;
 
-  const winner = new InstanceLock('claim-replaced-before', dataDir, {
-    killProcess: staleProbe,
-    now: () => now,
-    recoveryClaimLeaseMs: 100,
-  });
-  await winner.acquire();
+  const second = new InstanceLock('claim-replaced-before', dataDir);
+  const third = new InstanceLock('claim-replaced-before', dataDir);
+  await expect(second.acquire()).rejects.toBeInstanceOf(InstanceLockError);
+  await expect(third.acquire()).rejects.toBeInstanceOf(InstanceLockError);
+  expect(await readFile(lockPath, 'utf8')).toBe('2147483646\n0\n');
   resumeFirst();
-  await expect(firstAcquire).rejects.toThrow(/owner changed during stale recovery/);
-  await first.release();
+  await expect(firstAcquire).resolves.toBeUndefined();
   expect(await readFile(lockPath, 'utf8')).toStartWith(`${process.pid}\n`);
-  const loser = new InstanceLock('claim-replaced-before', dataDir);
-  await expect(loser.acquire()).rejects.toBeInstanceOf(InstanceLockError);
-  await winner.release();
+  await expect(second.acquire()).rejects.toBeInstanceOf(InstanceLockError);
+  await first.release();
 });
 
-test('a claimant replaced after removing stale main aborts before touching the winner', async () => {
+test('a live claimant remains fenced after removing stale main and before publication', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'logbun-ilock-claim-replaced-after-'));
   cleanupPaths.push(dataDir);
   const namespaceDir = join(dataDir, 'claim-replaced-after');
   const lockPath = join(namespaceDir, '.instance.lock');
   await mkdir(namespaceDir);
   await writeFile(lockPath, '2147483646\n0\n');
-  let now = 1_000;
   let signalMainRemoved!: () => void;
   const mainRemoved = new Promise<void>((resolve) => {
     signalMainRemoved = resolve;
@@ -429,8 +560,6 @@ test('a claimant replaced after removing stale main aborts before touching the w
   };
   const first = new InstanceLock('claim-replaced-after', dataDir, {
     killProcess: staleProbe,
-    now: () => now,
-    recoveryClaimLeaseMs: 100,
     afterStaleMainRemoved: async () => {
       signalMainRemoved();
       await firstMayResume;
@@ -438,20 +567,16 @@ test('a claimant replaced after removing stale main aborts before touching the w
   });
   const firstAcquire = first.acquire();
   await mainRemoved;
-  now = 1_101;
 
-  const winner = new InstanceLock('claim-replaced-after', dataDir, {
-    now: () => now,
-    recoveryClaimLeaseMs: 100,
-  });
-  await winner.acquire();
+  const second = new InstanceLock('claim-replaced-after', dataDir);
+  const third = new InstanceLock('claim-replaced-after', dataDir);
+  await expect(second.acquire()).rejects.toBeInstanceOf(InstanceLockError);
+  await expect(third.acquire()).rejects.toBeInstanceOf(InstanceLockError);
   resumeFirst();
-  await expect(firstAcquire).rejects.toThrow(/recovery ownership/);
-  await first.release();
+  await expect(firstAcquire).resolves.toBeUndefined();
   expect(await readFile(lockPath, 'utf8')).toStartWith(`${process.pid}\n`);
-  const loser = new InstanceLock('claim-replaced-after', dataDir);
-  await expect(loser.acquire()).rejects.toBeInstanceOf(InstanceLockError);
-  await winner.release();
+  await expect(second.acquire()).rejects.toBeInstanceOf(InstanceLockError);
+  await first.release();
 });
 
 test('concurrent stale recovery never unlinks the owner installed after a shared probe', async () => {
@@ -496,16 +621,7 @@ test('concurrent stale recovery never unlinks the owner installed after a shared
 
   const firstAcquire = first.acquire();
   const secondAcquire = second.acquire();
-  const reachedBarrier = await Promise.race([
-    bothObserved.then(() => true),
-    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 250)),
-  ]);
-  if (!reachedBarrier) {
-    releaseFirst();
-    releaseSecond();
-    await Promise.allSettled([firstAcquire, secondAcquire]);
-  }
-  expect(reachedBarrier).toBe(true);
+  await bothObserved;
 
   releaseFirst();
   await expect(firstAcquire).resolves.toBeUndefined();

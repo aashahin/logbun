@@ -10,8 +10,31 @@ import {
 import type { LogbunLog } from '../src/types';
 
 const cleanupPaths: string[] = [];
+const adapterHookSymbol = Symbol.for('logbun.FileReliabilityAdapter.testHooks');
+const hookedNamespaces = new Set<string>();
+
+interface AdapterTestHooks {
+  walDirectorySync?: (directory: string, reason: string) => void | Promise<void>;
+  dlqDirectorySync?: (directory: string, reason: string) => void | Promise<void>;
+}
+
+function setAdapterHooks(namespace: string, hooks: AdapterTestHooks): void {
+  const globalRecord = globalThis as unknown as Record<PropertyKey, unknown>;
+  let registry = globalRecord[adapterHookSymbol];
+  if (!(registry instanceof Map)) {
+    registry = new Map<string, AdapterTestHooks>();
+    globalRecord[adapterHookSymbol] = registry;
+  }
+  (registry as Map<string, AdapterTestHooks>).set(namespace, hooks);
+  hookedNamespaces.add(namespace);
+}
 
 afterEach(async () => {
+  const registry = (globalThis as unknown as Record<PropertyKey, unknown>)[adapterHookSymbol];
+  if (registry instanceof Map) {
+    for (const namespace of hookedNamespaces) registry.delete(namespace);
+  }
+  hookedNamespaces.clear();
   await Promise.all(
     cleanupPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -49,16 +72,18 @@ test('fresh DLQ initialization publishes every recursively created directory chi
   ]);
 });
 
-test.each(['namespace', 'dataDir', 'parent'] as const)(
+test.each(['namespace', 'dataDir', 'firstMissing', 'parent'] as const)(
   'DLQ retains and retries unexpected %s hierarchy sync debt before admission',
   async (level) => {
     const rootParent = await mkdtemp(join(tmpdir(), `logbun-dlq-hierarchy-${level}-`));
     cleanupPaths.push(rootParent);
-    const dataDir = join(rootParent, 'fresh-data');
+    const firstMissing = join(rootParent, 'missing-a');
+    const dataDir = join(firstMissing, 'fresh-data');
     const namespaceDir = join(dataDir, `hierarchy-${level}`);
     const targets = {
       namespace: namespaceDir,
       dataDir,
+      firstMissing,
       parent: rootParent,
     };
     const target = targets[level];
@@ -95,6 +120,53 @@ test.each(['namespace', 'dataDir', 'parent'] as const)(
   },
 );
 
+test.each(['namespace', 'dataDir', 'firstMissing', 'parent'] as const)(
+  'a replacement DLQ republishes the %s hierarchy after the failed instance is discarded',
+  async (level) => {
+    const rootParent = await mkdtemp(join(tmpdir(), `logbun-dlq-hierarchy-restart-${level}-`));
+    cleanupPaths.push(rootParent);
+    const firstMissing = join(rootParent, 'missing-a');
+    const dataDir = join(firstMissing, 'fresh-data');
+    const namespace = `hierarchy-restart-${level}`;
+    const namespaceDir = join(dataDir, namespace);
+    const target = {
+      namespace: namespaceDir,
+      dataDir,
+      firstMissing,
+      parent: rootParent,
+    }[level];
+    let failed = false;
+
+    const abandoned = new DLQStorage(namespace, dataDir, {
+      fsync: true,
+      directorySync: (directory, reason) => {
+        if (!failed && directory === target && reason === 'initialize-hierarchy') {
+          failed = true;
+          const error = new Error(`simulated abandoned ${level} hierarchy failure`) as NodeJS.ErrnoException;
+          error.code = 'EIO';
+          throw error;
+        }
+      },
+    });
+    await expect(abandoned.init()).rejects.toThrow(
+      new RegExp(`abandoned ${level} hierarchy failure`),
+    );
+
+    const replacementSyncs: string[] = [];
+    const replacement = new DLQStorage(namespace, dataDir, {
+      fsync: true,
+      directorySync: (directory, reason) => {
+        if (reason === 'initialize-hierarchy') replacementSyncs.push(directory);
+      },
+    });
+    await expect(replacement.init()).resolves.toBeUndefined();
+    expect(replacementSyncs).toContain(target);
+    await expect(
+      replacement.write('tenant-a', [log(`replacement-${level}`)]),
+    ).resolves.toBeString();
+  },
+);
+
 test('DLQ treats a Deno capability denial at the outer created parent as best-effort', async () => {
   const rootParent = await mkdtemp(join(tmpdir(), 'logbun-dlq-hierarchy-deno-'));
   cleanupPaths.push(rootParent);
@@ -125,26 +197,24 @@ test('adapter first-run sync order publishes WAL hierarchy before the later DLQ 
   const namespaceDir = join(dataDir, 'adapter-order');
   const walDir = join(namespaceDir, 'wal');
   const syncs: Array<{ owner: 'wal' | 'dlq'; directory: string; reason: string }> = [];
-  const adapter = new FileReliabilityAdapter(
-    {
-      namespace: 'adapter-order',
-      dataDir,
-      wal: {
-        fsync: true,
-      },
-      dlq: {
-        fsync: true,
-      },
+  setAdapterHooks('adapter-order', {
+    walDirectorySync: (directory, reason) => {
+      syncs.push({ owner: 'wal', directory, reason });
     },
-    {
-      walDirectorySync: (directory, reason) => {
-        syncs.push({ owner: 'wal', directory, reason });
-      },
-      dlqDirectorySync: (directory, reason) => {
-        syncs.push({ owner: 'dlq', directory, reason });
-      },
+    dlqDirectorySync: (directory, reason) => {
+      syncs.push({ owner: 'dlq', directory, reason });
     },
-  );
+  });
+  const adapter = new FileReliabilityAdapter({
+    namespace: 'adapter-order',
+    dataDir,
+    wal: {
+      fsync: true,
+    },
+    dlq: {
+      fsync: true,
+    },
+  });
 
   await adapter.init();
   expect(syncs).toEqual([
@@ -168,21 +238,19 @@ test('adapter DLQ publishes the full first-run hierarchy when WAL fsync is disab
   const dataDir = join(firstMissing, 'missing-b');
   const namespaceDir = join(dataDir, 'adapter-dlq-only');
   const syncs: Array<{ directory: string; reason: string }> = [];
-  const adapter = new FileReliabilityAdapter(
-    {
-      namespace: 'adapter-dlq-only',
-      dataDir,
-      wal: { fsync: false },
-      dlq: {
-        fsync: true,
-      },
+  setAdapterHooks('adapter-dlq-only', {
+    dlqDirectorySync: (directory, reason) => {
+      syncs.push({ directory, reason });
     },
-    {
-      dlqDirectorySync: (directory, reason) => {
-        syncs.push({ directory, reason });
-      },
+  });
+  const adapter = new FileReliabilityAdapter({
+    namespace: 'adapter-dlq-only',
+    dataDir,
+    wal: { fsync: false },
+    dlq: {
+      fsync: true,
     },
-  );
+  });
 
   await adapter.init();
   expect(syncs).toEqual([

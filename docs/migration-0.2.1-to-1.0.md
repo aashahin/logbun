@@ -123,6 +123,9 @@ deno run --allow-read=./.logbun --allow-write=./.logbun --allow-sys=uid,gid your
 ```
 
 Grant read/write on your configured `dataDir` (default `.logbun`).
+This is sufficient for live-owner exclusion. Add `--allow-run` when automatic
+recovery of a crashed process's instance lock is required; otherwise recovery
+fails closed and needs verified operator cleanup while the namespace is stopped.
 
 ### 8. Cloudflare Workers
 

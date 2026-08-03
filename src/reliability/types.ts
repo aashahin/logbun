@@ -175,4 +175,11 @@ export interface ReliabilityAdapter {
    * or null when idle. Used by Cloudflare DO alarm scheduling.
    */
   pendingMaintenanceDelayMs?(): Promise<number | null>;
+
+  /**
+   * Optional: restore a host wake-up after a maintenance attempt failed.
+   * Implementations must not swallow scheduling failures; the caller can then
+   * propagate so platforms such as Durable Objects retry the alarm handler.
+   */
+  rearmMaintenance?(): Promise<void>;
 }

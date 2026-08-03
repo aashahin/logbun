@@ -520,9 +520,12 @@ export class AuditLogger<TActions extends string = string> {
     if (!this.engine || this._degraded) {
       throw new Error('AuditLogger is not initialized');
     }
+    const failures: unknown[] = [];
+    let retentionFailure: unknown;
     try {
       await this.engine.batcher.flushAll();
     } catch (err) {
+      failures.push(err);
       this.emit({
         type: 'flush_fail',
         error: err instanceof Error ? err.message : String(err),
@@ -532,6 +535,7 @@ export class AuditLogger<TActions extends string = string> {
     try {
       await this.engine.retryEngine.scan();
     } catch (err) {
+      failures.push(err);
       this.emit({
         type: 'flush_fail',
         error: err instanceof Error ? err.message : String(err),
@@ -539,15 +543,36 @@ export class AuditLogger<TActions extends string = string> {
       });
     }
     if (this.config.retention) {
-      await runRetentionPrune({
-        tenancyMode: this.config.tenancy?.mode,
-        knownTenantIds: this.config.tenancy?.knownTenantIds,
-        pool: this.engine.pool,
-        baseAdapter: this.config.adapter,
-        retentionDays: this.config.retention.days,
-        onEvent: this.config.onEvent,
-      });
+      try {
+        await runRetentionPrune({
+          tenancyMode: this.config.tenancy?.mode,
+          knownTenantIds: this.config.tenancy?.knownTenantIds,
+          pool: this.engine.pool,
+          baseAdapter: this.config.adapter,
+          retentionDays: this.config.retention.days,
+          onEvent: this.config.onEvent,
+        });
+      } catch (err) {
+        failures.push(err);
+        retentionFailure = err;
+      }
     }
+
+    if (failures.length > 0 && this.engine.reliability.rearmMaintenance) {
+      try {
+        await this.engine.reliability.rearmMaintenance();
+      } catch (rearmError) {
+        throw new AggregateError(
+          [...failures, rearmError],
+          'maintenance failed and its host wake-up could not be restored',
+        );
+      }
+      if (failures.length === 1) throw failures[0];
+      throw new AggregateError(failures, 'multiple maintenance phases failed');
+    }
+    // Retention failures historically propagated on adapters without a host
+    // rearm seam; retain that contract. Flush/scan remain observable events.
+    if (retentionFailure !== undefined) throw retentionFailure;
   }
 
   async shutdown(): Promise<void> {

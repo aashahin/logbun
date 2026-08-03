@@ -416,6 +416,32 @@ test('delivery listing waits while a linked requeue transition is still running'
   expect(await dlq.listDead()).toEqual([]);
 });
 
+test('claim reports post-rename sync failure and durably rolls the batch back to pending', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-claim-sync-'));
+  cleanupPaths.push(dataDir);
+  let failNextDirectorySync = false;
+  const dlq = new DLQStorage('dlq-claim-sync', dataDir, {
+    fsync: true,
+    directorySync: () => {
+      if (!failNextDirectorySync) return;
+      failNextDirectorySync = false;
+      const error = new Error('simulated claim rename sync failure') as NodeJS.ErrnoException;
+      error.code = 'EIO';
+      throw error;
+    },
+  });
+  await dlq.init();
+  const id = await dlq.write('tenant-a', [makeLog('claim-sync', 'tenant-a')]);
+
+  failNextDirectorySync = true;
+  await expect(dlq.claim(id)).rejects.toThrow(/claim rename sync failure/);
+  expect(await readdir(dlq.directory)).toContain(`${id}.batch`);
+  expect(await readdir(dlq.directory)).not.toContain(`${id}.batch.processing`);
+  expect(await dlq.listPending()).toEqual([id]);
+  await expect(dlq.claim(id)).resolves.toMatchObject({ id });
+  await expect(dlq.claim(id)).resolves.toBeNull();
+});
+
 test('init fails closed for duplicate pending and dead states with different inodes', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'logbun-dlq-requeue-independent-'));
   cleanupPaths.push(dataDir);

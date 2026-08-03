@@ -39,6 +39,11 @@ flush, one DLQ scan, and retention pruning. `retryDlqNow()` is useful for an
 operator-triggered retry. Inspect and mutate dead letters only by their opaque
 IDs; filesystem paths are diagnostics, not authority.
 
+In a Durable Object, let `alarm()` propagate `runMaintenance()` rejection. The
+Cloudflare adapter first restores a pending-work alarm after a failed
+maintenance phase, then rejection also leaves the platform free to apply its
+alarm retry policy.
+
 Alert on `bootstrap_fail`, `degraded`, `wal_fail`, `drop`, `poison`,
 and sustained `flush_fail` events. A destination and DLQ failure deliberately
 leaves the journal unacknowledged; recovery will retry it after restart.
@@ -71,7 +76,14 @@ access to its parent; Logbun treats that denial as the capability boundary,
 relies on Deno to prevent access outside the grant, and physically validates
 the newly created data, namespace, WAL, and DLQ paths before use. The
 `--allow-sys=uid,gid` grant covers ownership metadata used by Deno's Node
-compatibility filesystem implementation. `--allow-run` is not required.
+compatibility filesystem implementation. `--allow-run` is not required for
+normal operation.
+That permission set enforces live-owner exclusivity and fails closed when a PID
+cannot be probed. Automatic recovery of a lock left by a crashed process needs
+process-probe permission (`--allow-run` in current Deno). If production policy
+forbids it, stop every process using the namespace and have an operator remove
+the verified stale `.instance.lock` and `.instance.lock.recovery` entries before
+restart; never remove them while an owner or recovery claimant may still run.
 
 ## Filesystem security model
 
@@ -94,12 +106,11 @@ Network filesystems may not provide the required exclusive-create or durability
 semantics.
 
 Stale-lock recovery claims are published only after complete PID/process-start
-metadata has been synced. A later process automatically replaces a claim whose
-owner is known dead or whose short recovery lease has expired; malformed claims
-left by older/crashed writers are eligible only after the same safety age.
-Permission or other unknown liveness-probe failures remain potentially live and
-fail closed during that lease, including Deno without an applicable process
-probe capability. Every claimant revalidates its claim inode around main-lock
-mutations, so an expired live claimant aborts rather than removing its
-replacement. Ordinary crash remnants do not require manual claim-file cleanup;
-do not manually remove a recent claim from a running namespace.
+metadata has been synced. A valid claim is replaced only when its process is
+known dead or its process-start identity proves PID reuse; it never expires by
+elapsed time. Malformed legacy/crash remnants are eligible only after the
+configured safety age. Permission or other unknown liveness-probe failures
+remain potentially live and fail closed indefinitely. Every claimant
+revalidates its claim inode around main-lock mutations. With process-probe
+permission, ordinary crash remnants recover automatically; otherwise use the
+fully stopped, operator-verified cleanup procedure above.

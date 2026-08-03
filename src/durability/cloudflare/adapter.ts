@@ -566,4 +566,17 @@ export class CloudflareReliabilityAdapter implements ReliabilityAdapter {
     if (!s.hasPendingWork) return null;
     return this.alarmDelayMs;
   }
+
+  /** Restore a consumed alarm after maintenance failed. */
+  async rearmMaintenance(): Promise<void> {
+    this.ensureReady();
+    if (!this.scheduleAlarms || typeof this.storage.setAlarm !== 'function') {
+      return;
+    }
+    const delay = await this.pendingMaintenanceDelayMs();
+    if (delay == null) return;
+    // Unlike admission's best-effort scheduler, a failure recovery must replace
+    // the consumed alarm and report setAlarm errors to the host.
+    await this.storage.setAlarm(Date.now() + Math.max(0, delay));
+  }
 }

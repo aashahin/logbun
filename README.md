@@ -153,8 +153,11 @@ const instanceId = Deno.env.get('INSTANCE_ID') ?? 'my-app-instance-1';
 `deno run --allow-env=INSTANCE_ID --allow-read=./.logbun --allow-write=./.logbun --allow-sys=uid,gid app.ts`
 
 The path-scoped grant supports first-run creation when `.logbun` does not yet
-exist. See the [filesystem threat model](./docs/production.md#filesystem-security-model)
-for the capability-boundary and same-user concurrency limitations.
+exist and makes unverifiable lock owners fail closed. Add `--allow-run` if this
+process must automatically recover a lock left by a crashed Deno process; live
+exclusivity itself does not require it. See the
+[filesystem threat model](./docs/production.md#filesystem-security-model) for
+the capability-boundary, stale-lock cleanup, and same-user limitations.
 
 For Bun's built-in SQLite destination specifically, import
 `BunSQLiteAdapter` from `logbun/adapters/bun-sqlite` in a Bun-only module.

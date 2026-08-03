@@ -91,6 +91,17 @@ const ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Current UUIDv7 IDs plus confined legacy opaque IDs, never filesystem paths. */
 const OPAQUE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
+/** Distinguishes a failed durability barrier after rename already mutated state. */
+class DLQPostRenameSyncError extends Error {
+  readonly originalError: unknown;
+
+  constructor(error: unknown) {
+    super(error instanceof Error ? error.message : String(error), { cause: error });
+    this.name = 'DLQPostRenameSyncError';
+    this.originalError = error;
+  }
+}
+
 /**
  * Parse DLQ file content.
  * v2: `{ v:2, id, tenantId, attempts, logs }`
@@ -582,8 +593,13 @@ export class DLQStorage {
   ): Promise<void> {
     if (!this.fsync) return;
     const createdStart = this.createdHierarchyStart ?? this.hierarchyStartPending;
-    if (!createdStart) return;
-    const outermostTarget = dirname(resolve(createdStart));
+    // mkdir only tells the process that created the hierarchy which segment was
+    // first missing. A replacement process cannot reconstruct where an earlier
+    // directory-fsync failed, so it conservatively republishes to the filesystem
+    // root when it has no creation marker.
+    const outermostTarget = createdStart
+      ? dirname(resolve(createdStart))
+      : undefined;
     let directory = this.namespaceDir;
     for (;;) {
       const allowPermissionBoundary =
@@ -603,6 +619,7 @@ export class DLQStorage {
       if (directory === outermostTarget) return;
       const parent = dirname(directory);
       if (parent === directory) {
+        if (!outermostTarget) return;
         throw new Error('DLQ created hierarchy escaped its configured data directory');
       }
       directory = parent;
@@ -613,7 +630,13 @@ export class DLQStorage {
     await this.assertSecureExistingFile(from);
     await this.assertSecureWriteTarget(to);
     await rename(from, to);
-    if (this.fsync) await this.fsyncDirectory();
+    if (this.fsync) {
+      try {
+        await this.fsyncDirectory();
+      } catch (error) {
+        throw new DLQPostRenameSyncError(error);
+      }
+    }
   }
 
   private async assertDestinationAbsent(path: string): Promise<void> {
@@ -1044,8 +1067,22 @@ export class DLQStorage {
       this.assertUnderDir(processingPath);
       try {
         await this.renameSecurely(pendingPath, processingPath);
-      } catch {
-        return null;
+      } catch (error) {
+        if (error instanceof DLQPostRenameSyncError) {
+          try {
+            // A claim is not visible until pending -> processing is durable.
+            // Restore the deliverable state before reporting that barrier.
+            await this.renameSecurely(processingPath, pendingPath);
+          } catch (rollbackError) {
+            throw new AggregateError(
+              [error.originalError, rollbackError],
+              'DLQ claim durability failed and rollback could not be made durable',
+            );
+          }
+          throw error.originalError;
+        }
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw error;
       }
       const batch = await this.readBatchFileUnlocked(processingPath);
       return { id: claimId, path: processingPath, batch };

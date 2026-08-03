@@ -14,9 +14,9 @@
  *   a malicious process with directory write access can replace/remove the lock.
  * - Holds the lock file handle open for the process lifetime after acquire.
  *
- * Deno: requires path-scoped `--allow-read` / `--allow-write` on the data
- * directory; `--allow-run` is not required because unknown PID-probe failures
- * are treated as potentially alive for the bounded recovery-claim lease.
+ * Deno: path-scoped `--allow-read` / `--allow-write` is enough for normal live
+ * exclusivity. Automatic stale-owner recovery additionally needs permission to
+ * probe the recorded process (currently `--allow-run`); unknown probes fail closed.
  */
 
 import { open as fsOpen, link, unlink, mkdir, lstat } from 'node:fs/promises';
@@ -42,10 +42,20 @@ export interface InstanceLockOptions {
     handle: FileHandle,
     metadata: string,
   ) => void | Promise<void>;
+  /** @internal Deterministic main-lock hard-link seam. */
+  mainLink?: (stagedPath: string, canonicalPath: string) => Promise<void>;
+  /** @internal Barrier after staged main metadata is synced, before publication. */
+  beforeMainPublish?: (
+    stagedPath: string,
+    canonicalPath: string,
+  ) => void | Promise<void>;
+  /** @internal Barrier after canonical publication, before staging cleanup. */
+  afterMainPublish?: (
+    stagedPath: string,
+    canonicalPath: string,
+  ) => void | Promise<void>;
   /** Age after which malformed legacy recovery claims may be reclaimed. */
   recoveryClaimStaleMs?: number;
-  /** Bounded lease after which even a potentially-live claim may be replaced. */
-  recoveryClaimLeaseMs?: number;
   /** @internal Deterministic clock seam for legacy-claim aging tests. */
   now?: () => number;
   /** @internal Process-start identity seam; null/throw means unverifiable. */
@@ -56,6 +66,8 @@ export interface InstanceLockOptions {
   afterStaleProbe?: () => void | Promise<void>;
   /** @internal Adversarial replacement seam after identity check, before unlink. */
   beforeOwnedUnlink?: (path: string) => void | Promise<void>;
+  /** @internal Barrier after the final identity check, immediately before unlink. */
+  afterOwnedUnlinkCheck?: (path: string) => void | Promise<void>;
   /** @internal Barrier after a stale main lock has been removed under a claim. */
   afterStaleMainRemoved?: () => void | Promise<void>;
 }
@@ -79,7 +91,6 @@ interface RecoveryClaimMetadata {
   v: 1;
   pid: number;
   processStartTimeMs: number;
-  claimedAtMs?: number;
 }
 
 function probePidLiveness(
@@ -144,10 +155,6 @@ function parseRecoveryClaim(raw: string): RecoveryClaimMetadata | null {
       v: 1,
       pid: parsed.pid!,
       processStartTimeMs: parsed.processStartTimeMs!,
-      claimedAtMs:
-        Number.isFinite(parsed.claimedAtMs) && parsed.claimedAtMs! >= 0
-          ? parsed.claimedAtMs
-          : undefined,
     };
   } catch {
     return null;
@@ -168,14 +175,17 @@ export class InstanceLock {
   private readonly writeRecoveryMetadata: NonNullable<
     InstanceLockOptions['writeRecoveryMetadata']
   >;
+  private readonly mainLink: NonNullable<InstanceLockOptions['mainLink']>;
+  private readonly beforeMainPublish?: InstanceLockOptions['beforeMainPublish'];
+  private readonly afterMainPublish?: InstanceLockOptions['afterMainPublish'];
   private readonly recoveryClaimStaleMs: number;
-  private readonly recoveryClaimLeaseMs: number;
   private readonly now: NonNullable<InstanceLockOptions['now']>;
   private readonly readProcessStartTimeMs: NonNullable<
     InstanceLockOptions['readProcessStartTimeMs']
   >;
   private readonly afterStaleProbe?: InstanceLockOptions['afterStaleProbe'];
   private readonly beforeOwnedUnlink?: InstanceLockOptions['beforeOwnedUnlink'];
+  private readonly afterOwnedUnlinkCheck?: InstanceLockOptions['afterOwnedUnlinkCheck'];
   private readonly afterStaleMainRemoved?: InstanceLockOptions['afterStaleMainRemoved'];
   private handle: FileHandle | null = null;
   private ownedIdentity: LockIdentity | null = null;
@@ -198,16 +208,16 @@ export class InstanceLock {
       await handle.writeFile(metadata, 'utf8');
       await handle.sync();
     });
+    this.mainLink = options?.mainLink ?? link;
+    this.beforeMainPublish = options?.beforeMainPublish;
+    this.afterMainPublish = options?.afterMainPublish;
     this.recoveryClaimStaleMs = Math.max(0, options?.recoveryClaimStaleMs ?? 60_000);
-    this.recoveryClaimLeaseMs = Math.max(
-      1,
-      options?.recoveryClaimLeaseMs ?? this.recoveryClaimStaleMs,
-    );
     this.now = options?.now ?? Date.now;
     this.readProcessStartTimeMs =
       options?.readProcessStartTimeMs ?? readLinuxProcessStartTimeMs;
     this.afterStaleProbe = options?.afterStaleProbe;
     this.beforeOwnedUnlink = options?.beforeOwnedUnlink;
+    this.afterOwnedUnlinkCheck = options?.afterOwnedUnlinkCheck;
     this.afterStaleMainRemoved = options?.afterStaleMainRemoved;
   }
 
@@ -232,6 +242,7 @@ export class InstanceLock {
       // compare-and-unlink primitive, as documented in the threat model.
       const confirmed = await lstat(path, { bigint: true });
       if (confirmed.dev !== identity.dev || confirmed.ino !== identity.ino) return false;
+      if (path === this.path) await this.afterOwnedUnlinkCheck?.(path);
       await unlink(path);
       return true;
     } catch (error) {
@@ -310,7 +321,6 @@ export class InstanceLock {
         v: 1,
         pid: process.pid,
         processStartTimeMs: CURRENT_PROCESS_START_TIME_MS,
-        claimedAtMs: this.now(),
       };
       await this.writeRecoveryMetadata(handle, `${JSON.stringify(metadata)}\n`);
       const tempInfo = await lstat(tempPath, { bigint: true });
@@ -374,16 +384,14 @@ export class InstanceLock {
         );
       }
 
-      const claimAgeMs = this.now() - (owner.metadata?.claimedAtMs ?? owner.mtimeMs);
-      const leaseExpired =
-        Number.isFinite(claimAgeMs) && claimAgeMs >= this.recoveryClaimLeaseMs;
       if (owner.metadata) {
-        if (await this.isOwnerAlive(owner.metadata) && !leaseExpired) {
+        if (await this.isOwnerAlive(owner.metadata)) {
           throw new InstanceLockError(
             `instance_lock_held: stale recovery is already in progress for ${this.path}`,
           );
         }
       } else {
+        const claimAgeMs = this.now() - owner.mtimeMs;
         if (!Number.isFinite(claimAgeMs) || claimAgeMs < this.recoveryClaimStaleMs) {
           throw new InstanceLockError(
             `instance_lock_held: recovery metadata is incomplete and may still be active for ${this.path}`,
@@ -427,14 +435,27 @@ export class InstanceLock {
     }
   }
 
-  private async installMainLock(
-    createdHandle: FileHandle,
+  private async publishMainLock(
     recoveryClaim: RecoveryClaim | null,
   ): Promise<void> {
+    const tempPath = `${this.path}.${randomUUIDv7()}.tmp`;
+    let createdHandle: FileHandle | null = null;
     let identity: LockIdentity | null = null;
+    let published = false;
     try {
+      createdHandle = await fsOpen(tempPath, 'wx');
       const createdInfo = await createdHandle.stat({ bigint: true });
       identity = { dev: createdInfo.dev, ino: createdInfo.ino };
+      await this.writeMetadata(
+        createdHandle,
+        `${process.pid}\n${CURRENT_PROCESS_START_TIME_MS}\n`,
+      );
+      const stagedInfo = await lstat(tempPath, { bigint: true });
+      if (stagedInfo.dev !== identity.dev || stagedInfo.ino !== identity.ino) {
+        throw new InstanceLockError(
+          `instance_lock_held: main lock staging changed for ${this.path}`,
+        );
+      }
       if (recoveryClaim) {
         await this.assertRecoveryClaimOwned(recoveryClaim);
       } else if (await this.recoveryClaimExists()) {
@@ -442,10 +463,27 @@ export class InstanceLock {
           `instance_lock_held: stale recovery is in progress for ${this.path}`,
         );
       }
-      await this.writeMetadata(
-        createdHandle,
-        `${process.pid}\n${CURRENT_PROCESS_START_TIME_MS}\n`,
-      );
+      await this.beforeMainPublish?.(tempPath, this.path);
+      if (recoveryClaim) await this.assertRecoveryClaimOwned(recoveryClaim);
+      try {
+        await this.mainLink(tempPath, this.path);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (['EXDEV', 'ENOSYS', 'ENOTSUP', 'EOPNOTSUPP', 'EPERM'].includes(code ?? '')) {
+          throw new InstanceLockError(
+            `instance_lock_atomic_publication_unsupported: main lock requires same-filesystem hard links (${code ?? 'unknown'})`,
+          );
+        }
+        throw error;
+      }
+      published = true;
+      const canonicalInfo = await lstat(this.path, { bigint: true });
+      if (canonicalInfo.dev !== identity.dev || canonicalInfo.ino !== identity.ino) {
+        throw new InstanceLockError(
+          `instance_lock_held: main lock publication changed for ${this.path}`,
+        );
+      }
+      await this.afterMainPublish?.(tempPath, this.path);
       if (recoveryClaim) {
         await this.assertRecoveryClaimOwned(recoveryClaim);
       } else if (await this.recoveryClaimExists()) {
@@ -453,11 +491,15 @@ export class InstanceLock {
           `instance_lock_held: stale recovery started while acquiring ${this.path}`,
         );
       }
+      await this.removePathIfSame(tempPath, identity);
       this.handle = createdHandle;
       this.ownedIdentity = identity;
     } catch (error) {
-      await createdHandle.close().catch(() => undefined);
-      if (identity) await this.cleanupCreatedPath(this.path, identity);
+      if (createdHandle) await createdHandle.close().catch(() => undefined);
+      if (identity) {
+        await this.cleanupCreatedPath(tempPath, identity);
+        if (published) await this.cleanupCreatedPath(this.path, identity);
+      }
       throw error;
     }
   }
@@ -513,9 +555,8 @@ export class InstanceLock {
     }
 
     await this.assertRecoveryClaimOwned(claim);
-    let createdHandle: FileHandle;
     try {
-      createdHandle = await fsOpen(this.path, 'wx');
+      await this.publishMainLock(claim);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
         throw new InstanceLockError(
@@ -524,7 +565,6 @@ export class InstanceLock {
       }
       throw error;
     }
-    await this.installMainLock(createdHandle, claim);
   }
 
   async acquire(): Promise<void> {
@@ -543,9 +583,9 @@ export class InstanceLock {
         }
       }
 
-      let createdHandle: FileHandle;
       try {
-        createdHandle = await fsOpen(this.path, 'wx');
+        await this.publishMainLock(null);
+        return;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
           throw error instanceof Error
@@ -586,9 +626,6 @@ export class InstanceLock {
           await this.releaseRecoveryClaim(claim);
         }
       }
-
-      await this.installMainLock(createdHandle, null);
-      return;
     }
 
     throw new InstanceLockError(

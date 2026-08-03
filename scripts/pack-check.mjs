@@ -36,6 +36,21 @@ try {
   await copyFile(join(root, 'scripts', 'packed-node-smoke.mjs'), join(consumer, 'packed-node-smoke.mjs'));
   const packageJson = JSON.parse(await readFile(join(consumer, 'node_modules', 'logbun', 'package.json'), 'utf8'));
   if (packageJson.version !== '1.0.0') throw new Error('packed package version mismatch');
+  for (const declarationName of ['index.d.ts', 'index.d.cts']) {
+    const declaration = await readFile(
+      join(consumer, 'node_modules', 'logbun', 'dist', 'durability', 'filesystem', declarationName),
+      'utf8',
+    );
+    if (declaration.includes('FileReliabilityAdapterInternals')) {
+      throw new Error(`${declarationName} leaked FileReliabilityAdapterInternals`);
+    }
+    const classStart = declaration.indexOf('declare class FileReliabilityAdapter');
+    const classEnd = declaration.indexOf('declare class InstanceLockError', classStart);
+    const adapterDeclaration = declaration.slice(classStart, classEnd);
+    if (!adapterDeclaration.includes('constructor(options: FileReliabilityAdapterOptions);')) {
+      throw new Error(`${declarationName} does not expose the one-argument adapter constructor`);
+    }
+  }
   await writeFile(
     join(consumer, 'consumer.mts'),
     [

@@ -74,7 +74,11 @@ Deno consumes the npm package and needs filesystem permissions, for example
 `deno run --allow-read=./.logbun --allow-write=./.logbun --allow-sys=uid,gid app.ts`.
 The configured directory may be absent on first run. When Deno denies metadata
 access above that missing path, Logbun treats the denial as the runtime
-capability boundary and validates the created in-scope paths afterwards.
+capability boundary and validates the created in-scope paths afterwards. This
+grant is enough for live lock exclusivity, but automatic recovery after a
+process crash requires Deno process-probe permission (`--allow-run`). Without
+it, stale locks fail closed until an operator verifies that the namespace is
+fully stopped and removes the stale lock entries.
 
 ### Cloudflare Workers: `CloudflareReliabilityAdapter`
 

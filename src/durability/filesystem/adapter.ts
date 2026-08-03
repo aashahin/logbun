@@ -39,10 +39,20 @@ export interface FileReliabilityDlqOptions {
   maxEntries?: number;
 }
 
-/** @internal Constructor seams kept out of the supported adapter options. */
-interface FileReliabilityAdapterInternals {
+/** Source-only test seams discovered through a process-local symbol registry. */
+interface FileReliabilityAdapterTestHooks {
   walDirectorySync?: WALStorageOptions['directorySync'];
   dlqDirectorySync?: DLQStorageOptions['directorySync'];
+  afterLockAcquire?: () => void | Promise<void>;
+}
+
+const TEST_HOOKS_SYMBOL = Symbol.for('logbun.FileReliabilityAdapter.testHooks');
+
+function testHooksFor(namespace: string): FileReliabilityAdapterTestHooks {
+  const globalRecord = globalThis as unknown as Record<PropertyKey, unknown>;
+  const registry = globalRecord[TEST_HOOKS_SYMBOL];
+  if (!(registry instanceof Map)) return {};
+  return (registry as Map<string, FileReliabilityAdapterTestHooks>).get(namespace) ?? {};
 }
 
 export interface FileReliabilityAdapterOptions {
@@ -86,17 +96,16 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
   private readonly encryptionKeyMaterial?: string | Uint8Array;
   private readonly walOpts: FileReliabilityWalOptions;
   private readonly dlqOpts: FileReliabilityDlqOptions;
-  private readonly internals: FileReliabilityAdapterInternals;
 
   private wal: WALStorage | null = null;
   private dlq: DLQStorage | null = null;
   private lock: InstanceLock | null = null;
   private ready = false;
+  private initPromise: Promise<void> | null = null;
+  private queuedInitPromise: Promise<void> | null = null;
+  private closePromise: Promise<void> | null = null;
 
-  constructor(
-    options: FileReliabilityAdapterOptions,
-    internals: FileReliabilityAdapterInternals = {},
-  ) {
+  constructor(options: FileReliabilityAdapterOptions) {
     if (!options?.namespace) {
       throw new Error('FileReliabilityAdapter requires namespace');
     }
@@ -107,7 +116,6 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
     this.encryptionKeyMaterial = options.encryptionKey;
     this.walOpts = options.wal ?? {};
     this.dlqOpts = options.dlq ?? {};
-    this.internals = internals;
   }
 
   /** Underlying WAL (tests / advanced). */
@@ -120,73 +128,133 @@ export class FileReliabilityAdapter implements ReliabilityAdapter {
     return this.dlq;
   }
 
-  async init(): Promise<void> {
-    if (this.ready) return;
-
-    // Validate before the instance lock or WAL can create anything through a
-    // redirected ancestor. Storage implementations validate again after mkdir.
-    const root = resolveLogbunDir(this.namespace, this.dataDir);
-    await assertNoSymlinkPath(root, 'FileReliabilityAdapter data root');
-    await assertNoSymlinkPath(join(root, 'wal'), 'FileReliabilityAdapter WAL path');
-    await assertNoSymlinkPath(join(root, 'dlq'), 'FileReliabilityAdapter DLQ path');
-    if (this.wantLock) {
-      await assertNoSymlinkPath(
-        join(root, '.instance.lock'),
-        'FileReliabilityAdapter lock path',
-      );
+  init(): Promise<void> {
+    if (this.closePromise) {
+      if (this.queuedInitPromise) return this.queuedInitPromise;
+      const queued = this.closePromise.then(() => this.init());
+      const tracked = queued.finally(() => {
+        if (this.queuedInitPromise === tracked) this.queuedInitPromise = null;
+      });
+      this.queuedInitPromise = tracked;
+      return tracked;
     }
+    if (this.ready) return Promise.resolve();
+    if (this.initPromise) return this.initPromise;
 
-    if (this.wantLock) {
-      this.lock = new InstanceLock(this.namespace, this.dataDir);
-      await this.lock.acquire();
-    }
-
-    let encryptionKeyBytes: Uint8Array | undefined;
-    if (this.encryptionKeyMaterial != null) {
-      encryptionKeyBytes = await normalizeEncryptionKey(
-        this.encryptionKeyMaterial
-      );
-    }
-
-    const walOptions: WALStorageOptions = {
-      fsync: this.walOpts.fsync ?? true,
-      compactAckThreshold: this.walOpts.compactAckThreshold ?? 256,
-      maxBytes: this.maxWalBytes,
-      maxWalBytes: this.maxWalBytes,
-      hardMaxBytes: this.walOpts.hardMaxBytes !== false,
-      segmentBytes: this.walOpts.segmentBytes ?? WAL_SEGMENT_BYTES_DEFAULT,
-      encryptionKey: encryptionKeyBytes,
-      createdHierarchyStart: this.lock?.createdHierarchyStart,
-      directorySync: this.internals.walDirectorySync,
-    };
-    this.wal = new WALStorage(this.namespace, this.dataDir, walOptions);
-    await this.wal.init();
-
-    const dlqOptions: DLQStorageOptions = {
-      fsync: this.dlqOpts.fsync ?? true,
-      maxFiles: this.dlqOpts.maxEntries ?? 10_000,
-      encryptionKey: encryptionKeyBytes,
-      directorySync: this.internals.dlqDirectorySync,
-      createdHierarchyStart:
-        this.lock?.createdHierarchyStart ?? this.wal.createdHierarchyStart,
-    };
-    this.dlq = new DLQStorage(this.namespace, this.dataDir, dlqOptions);
-    await this.dlq.init();
-
-    this.ready = true;
+    const initializing = this.initialize();
+    const tracked = initializing.finally(() => {
+      if (this.initPromise === tracked) this.initPromise = null;
+    });
+    this.initPromise = tracked;
+    return tracked;
   }
 
-  async close(): Promise<void> {
-    if (this.wal) {
-      await this.wal.close();
+  private async initialize(): Promise<void> {
+    let localLock: InstanceLock | null = null;
+    let localWal: WALStorage | null = null;
+    let localDlq: DLQStorage | null = null;
+    const hooks = testHooksFor(this.namespace);
+
+    try {
+      // Validate before the instance lock or WAL can create anything through a
+      // redirected ancestor. Storage implementations validate again after mkdir.
+      const root = resolveLogbunDir(this.namespace, this.dataDir);
+      await assertNoSymlinkPath(root, 'FileReliabilityAdapter data root');
+      await assertNoSymlinkPath(join(root, 'wal'), 'FileReliabilityAdapter WAL path');
+      await assertNoSymlinkPath(join(root, 'dlq'), 'FileReliabilityAdapter DLQ path');
+      if (this.wantLock) {
+        await assertNoSymlinkPath(
+          join(root, '.instance.lock'),
+          'FileReliabilityAdapter lock path',
+        );
+      }
+
+      if (this.wantLock) {
+        localLock = new InstanceLock(this.namespace, this.dataDir);
+        await localLock.acquire();
+        await hooks.afterLockAcquire?.();
+      }
+
+      let encryptionKeyBytes: Uint8Array | undefined;
+      if (this.encryptionKeyMaterial != null) {
+        encryptionKeyBytes = await normalizeEncryptionKey(
+          this.encryptionKeyMaterial
+        );
+      }
+
+      const walOptions: WALStorageOptions = {
+        fsync: this.walOpts.fsync ?? true,
+        compactAckThreshold: this.walOpts.compactAckThreshold ?? 256,
+        maxBytes: this.maxWalBytes,
+        maxWalBytes: this.maxWalBytes,
+        hardMaxBytes: this.walOpts.hardMaxBytes !== false,
+        segmentBytes: this.walOpts.segmentBytes ?? WAL_SEGMENT_BYTES_DEFAULT,
+        encryptionKey: encryptionKeyBytes,
+        createdHierarchyStart: localLock?.createdHierarchyStart,
+        directorySync: hooks.walDirectorySync,
+      };
+      localWal = new WALStorage(this.namespace, this.dataDir, walOptions);
+      await localWal.init();
+
+      const dlqOptions: DLQStorageOptions = {
+        fsync: this.dlqOpts.fsync ?? true,
+        maxFiles: this.dlqOpts.maxEntries ?? 10_000,
+        encryptionKey: encryptionKeyBytes,
+        directorySync: hooks.dlqDirectorySync,
+        createdHierarchyStart:
+          localLock?.createdHierarchyStart ?? localWal.createdHierarchyStart,
+      };
+      localDlq = new DLQStorage(this.namespace, this.dataDir, dlqOptions);
+      await localDlq.init();
+
+      // Publish the initialized resource set only after every component succeeds.
+      this.lock = localLock;
+      this.wal = localWal;
+      this.dlq = localDlq;
+      this.ready = true;
+    } catch (error) {
+      const cleanupErrors: unknown[] = [];
+      try {
+        await localWal?.close();
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      try {
+        await localLock?.release();
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...cleanupErrors],
+          'FileReliabilityAdapter initialization failed and cleanup was incomplete',
+        );
+      }
+      throw error;
+    }
+  }
+
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    const closing = (async () => {
+      const initializing = this.initPromise;
+      if (initializing) await initializing.catch(() => undefined);
+
+      const wal = this.wal;
+      const lock = this.lock;
+      this.ready = false;
       this.wal = null;
-    }
-    this.dlq = null;
-    if (this.lock) {
-      await this.lock.release();
+      this.dlq = null;
       this.lock = null;
-    }
-    this.ready = false;
+
+      await wal?.close();
+      await lock?.release();
+    })();
+    const tracked = closing.finally(() => {
+      if (this.closePromise === tracked) this.closePromise = null;
+    });
+    this.closePromise = tracked;
+    return tracked;
   }
 
   private ensure(): { wal: WALStorage; dlq: DLQStorage } {

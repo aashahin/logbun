@@ -37,6 +37,7 @@ export class AuditDO {
   readonly audit: AuditLogger;
   delivered = 0;
   failDestination = false;
+  failNextMaintenanceScan = false;
 
   constructor(readonly state: StateLike) {
     this.reliability = new CloudflareReliabilityAdapter({
@@ -44,6 +45,14 @@ export class AuditDO {
       tablePrefix: 'audit_test',
       alarmDelayMs: 250,
     });
+    const listDlq = this.reliability.listDlq.bind(this.reliability);
+    this.reliability.listDlq = async (options) => {
+      if (this.failNextMaintenanceScan) {
+        this.failNextMaintenanceScan = false;
+        throw new Error('simulated consumed-alarm maintenance failure');
+      }
+      return listDlq(options);
+    };
     this.audit = new AuditLogger({
       namespace: 'worker-do',
       mode: 'durable',
@@ -74,6 +83,10 @@ export class AuditDO {
     if (url.pathname === '/maintenance') {
       await this.audit.runMaintenance();
       return json(await this.audit.getStatsDetailed());
+    }
+    if (url.pathname === '/fail-maintenance-once') {
+      this.failNextMaintenanceScan = true;
+      return json({ armed: true });
     }
     if (url.pathname === '/clear-alarm') {
       await this.state.storage.deleteAlarm?.();
